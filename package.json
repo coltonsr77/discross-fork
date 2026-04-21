@@ -15,7 +15,7 @@
         "dotenv": "^17.2.3",
         "escape-html": "^1.0.3",
         "formidable": "^3.5.4",
-        "geoip-lite": "^1.4.10",
+        "geoip-lite": "^2.0.1",
         "he": "^1.2.0",
         "highlight.js": "^11.11.1",
         "markdown-it": "^14.1.0",
