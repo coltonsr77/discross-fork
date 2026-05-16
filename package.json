@@ -24,7 +24,7 @@
         "sharp": "^0.34.4",
         "snowtransfer": "^0.15.0",
         "ua-parser-js": "^2.0.8",
-        "uuid": "^13.0.0",
+        "uuid": "^14.0.0",
         "ws": "^8.17.0"
     },
     "scripts": {
