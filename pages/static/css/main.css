@@ -50,6 +50,7 @@ h1 {
     font-weight: 700;
     line-height: 1.2;
     font-family: inherit;
+    color: #dcdcdf;
 }
 h2 {
     margin: 8px 0 4px 0;
@@ -57,6 +58,7 @@ h2 {
     font-weight: 700;
     line-height: 1.2;
     font-family: inherit;
+    color: #dcdcdf;
 }
 h3 {
     margin: 8px 0 4px 0;
@@ -64,6 +66,7 @@ h3 {
     font-weight: 700;
     line-height: 1.2;
     font-family: inherit;
+    color: #dcdcdf;
 }
 p,
 ul,
@@ -461,6 +464,12 @@ pre code {
     background: #1a1a1e;
     border-top: 1px solid #40444b;
     padding: 12px;
+    /* iOS safe area: constant() for older iOS (<11.2), env() for newer */
+    padding-bottom: 12px;
+    padding-bottom: constant(safe-area-inset-bottom);
+    padding-bottom: calc(12px + constant(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
     width: 100%;
 }
 
@@ -811,10 +820,12 @@ textarea:focus {
 }
 #canvas-wrapper {
     margin: 0 auto 20px auto;
-    display: block;
+    display: flex;
+    justify-content: center;
+    text-align: center;
     padding: 5px;
-    width: 610px;
-    max-width: 100%;
+    width: 100%;
+    max-width: 610px;
     box-sizing: border-box;
     position: relative;
     z-index: 10;
@@ -823,8 +834,10 @@ canvas {
     background: #ffffff;
     cursor: crosshair;
     display: block;
+    margin: 0 auto;
     border: 1px solid #202225;
     max-width: 100%;
+    touch-action: none;
 }
 
 /* Mobile-only break in draw toolbar */
@@ -1293,7 +1306,7 @@ html.page-draw #wrapper {
 }
 
 html.page-draw body {
-    overflow-y: auto;
+    overflow: hidden;
     /* min-height: 100vh omitted — vh units not supported in IE8/Opera 9.x */
 }
 
@@ -2742,12 +2755,14 @@ html.page-draw #wrapper {
 
 #canvas-wrapper {
     flex: 1;
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
+    display: block;
     overflow: auto;
     width: 100%;
-    margin: 0;
+    max-width: none;
+    margin: 0 auto;
+    /* text-align: center centers the inline-block canvas on browsers
+       that don't support flexbox (Old 3DS NetFront / Opera 9.5 DSi) */
+    text-align: center;
 }
 
 /* ================================================================

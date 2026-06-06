@@ -20,6 +20,7 @@ const {
     parseCookies,
     loadAndRenderPageTemplate,
     getTemplate,
+    generateSEOMetadata,
 } = require('./utils.js');
 
 // Templates for viewing the channels in a server
@@ -289,7 +290,7 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                 refreshDiscordServers(bot, discordID).catch(console.error);
             }
 
-            const data = auth.dbQueryAll('SELECT * FROM servers WHERE discordID=?', [discordID]);
+            const data = auth.queryAll('SELECT * FROM servers WHERE discordID=?', [discordID]);
 
             for (const serverData of data) {
                 const serverID = serverData.serverID;
@@ -307,7 +308,7 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                             };
                         } catch (err) {
                             // Delete from database if member isn't found
-                            auth.dbQueryRun(
+                            auth.queryRun(
                                 'DELETE FROM servers WHERE serverID=? AND discordID=?',
                                 [server.id, discordID]
                             );
@@ -337,7 +338,7 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                     // If the bot hasn't connected yet, skip deletion so servers are preserved during boot.
                     if (clientIsReady) {
                         // bot is connected and the guild truly isn't in cache -> safe to delete
-                        auth.dbQueryRun('DELETE FROM servers WHERE serverID=?', [serverID]);
+                        auth.queryRun('DELETE FROM servers WHERE serverID=?', [serverID]);
                         serversDeleted++;
                     } else {
                         // bot not ready / not connected: do not delete the server row; treat as temporarily missing
@@ -362,10 +363,12 @@ exports.processServer = async function (bot, req, res, args, discordID) {
         // syncNeeded already parsed via parsedUrl above
         const syncNeeded = parsedUrl.searchParams.get('sync_needed');
 
+        let serverName = '';
         if (args[2]) {
             const targetServer = bot.client.guilds.cache.get(args[2]);
-            await lock.acquire(discordID, async () => {
-                if (targetServer) {
+            if (targetServer) {
+                serverName = targetServer.name;
+                await lock.acquire(discordID, async () => {
                     response = renderTemplate(response, {
                         DISCORD_NAME: render('server/partials/server-name-header', {
                             NAME: escape(normalizeWeirdUnicode(targetServer.name)),
@@ -384,25 +387,38 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                             CHANNEL_LIST: server_list_only_template,
                         });
                     }
-                } else {
-                    response = renderTemplate(response, { DISCORD_NAME: '' });
-                    response = renderTemplate(response, { CHANNEL_LIST: 'Invalid channel!' });
-                }
-            });
+                });
+            } else {
+                response = renderTemplate(response, { DISCORD_NAME: '' });
+                response = renderTemplate(response, { CHANNEL_LIST: 'Invalid channel!' });
+            }
         } else {
             // If no specific server is selected, choose template based on whether user has servers
             if (serverList.trim() === '') {
                 response = renderTemplate(response, { CHANNEL_LIST: sync_warning_template });
-            } else if (syncNeeded === 'true' || serversDeleted > 0) {
-                response = renderTemplate(response, { CHANNEL_LIST: server_list_only_template });
             } else {
                 response = renderTemplate(response, { CHANNEL_LIST: server_list_only_template });
             }
             response = renderTemplate(response, { DISCORD_NAME: '' });
         }
 
+        const normalizedServerName = serverName ? normalizeWeirdUnicode(serverName) : '';
+        const pageTitle = normalizedServerName
+            ? `${normalizedServerName}${normalizedServerName.toLowerCase() === 'discross' ? '' : ' - Discross'}`
+            : 'Server Menu - Discross';
+        const seoDescription = normalizedServerName
+            ? `Browse channels and chat in ${normalizedServerName} on Discross, the universal Discord client.`
+            : 'Access your Discord servers and channels on Discross, the universal Discord client.';
+
         // Render remaining placeholders including USER_ID and USER_NAME
-        response = renderTemplate(response, templateData);
+        response = renderTemplate(response, {
+            ...templateData,
+            PAGE_TITLE: pageTitle,
+            SEO_METADATA: generateSEOMetadata(req, {
+                title: pageTitle,
+                description: seoDescription,
+            }),
+        });
 
         const imagesCookie =
             urlImages !== null

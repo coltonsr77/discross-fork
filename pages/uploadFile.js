@@ -177,15 +177,14 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                                 );
                             } else {
                                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                                res.end(
-                                    JSON.stringify({ success: false, error: errorMsg })
-                                );
+                                res.end(JSON.stringify({ success: false, error: errorMsg }));
                             }
                             resolve();
                             return;
                         }
 
-                        const originalFilename = file.originalFilename || file.name || 'uploaded_file';
+                        const originalFilename =
+                            file.originalFilename || file.name || 'uploaded_file';
                         const isMKV = originalFilename.toLowerCase().endsWith('.mkv');
 
                         const messageText = Array.isArray(fields.message)
@@ -201,15 +200,27 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                             : '';
 
                         // Log upload start
-                        console.log(`Starting upload to transfer service: ${originalFilename} (${file.size} bytes)`);
+                        console.log(
+                            `Starting upload to transfer service: ${originalFilename} (${file.size} bytes)`
+                        );
 
                         // Basic sanity check for common file types
-                        if (isMKV && file.size < 1024 * 50) { // MKV headers alone are usually a few KB, but 50KB is a very safe "is this even a video" floor
-                            console.warn(`Warning: MKV file ${originalFilename} is suspiciously small (${file.size} bytes).`);
+                        if (isMKV && file.size < 1024 * 50) {
+                            // MKV headers alone are usually a few KB, but 50KB is a very safe "is this even a video" floor
+                            console.warn(
+                                `Warning: MKV file ${originalFilename} is suspiciously small (${file.size} bytes).`
+                            );
                         }
 
                         // SUPPORT BOTH VERSIONS OF FORMIDABLE (v1 uses .path, v2/v3 uses .filepath)
                         const filePath = file.filepath || file.path;
+
+                        // Function to safely delete the temp file
+                        const cleanup = () => {
+                            fs.unlink(filePath, (err) => {
+                                if (err) console.warn(`Failed to delete temp file ${filePath}:`, err);
+                            });
+                        };
 
                         const channel = await bot.client.channels.fetch(channelId);
                         const member = await channel.guild.members.fetch(discordID);
@@ -219,6 +230,7 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                                 .permissionsIn(channel)
                                 .has(discord.PermissionFlagsBits.SendMessages)
                         ) {
+                            cleanup();
                             if (isTraditionalSubmission) {
                                 res.writeHead(403, { 'Content-Type': 'text/html' });
                                 res.end(
@@ -246,6 +258,7 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                                 await webhook.edit({ channel: channel.id });
                             }
                         } catch (err) {
+                            cleanup();
                             console.log('Webhook error:', err.message || err);
                             if (isTraditionalSubmission) {
                                 res.writeHead(403, { 'Content-Type': 'text/html' });
@@ -277,6 +290,7 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                             filePath,
                             file.originalFilename || file.name || 'uploaded_file'
                         ).catch((uploadError) => {
+                            cleanup();
                             console.error('Error uploading to transfer.archivete.am:', uploadError);
                             if (isTraditionalSubmission) {
                                 res.writeHead(500, { 'Content-Type': 'text/html' });
@@ -302,6 +316,9 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
                         });
                         if (transferUrl === undefined) return;
 
+                        // Delete temp file after successful upload
+                        cleanup();
+
                         // Send message with just the transfer.archivete.am URL as a link
                         const message = await webhook.send({
                             content: transferUrl,
@@ -311,7 +328,7 @@ exports.uploadFile = async function uploadFile(bot, req, res, args, discordID) {
 
                         const userAgentStr = req.headers['user-agent'];
                         if (userAgentStr && message && message.id) {
-                            auth.dbQueryRun(
+                            auth.queryRun(
                                 'INSERT OR REPLACE INTO message_user_agents (messageID, userAgent) VALUES (?, ?)',
                                 [message.id, userAgentStr]
                             );

@@ -15,6 +15,28 @@ const options = {};
 
 const sentryEnabled = !!process.env.SENTRY_DSN;
 
+process.on('SIGINT', async () => {
+    console.info('Shutting down gracefully...');
+    if (bot.client) {
+        bot.client.destroy();
+    }
+    if (sentryEnabled) {
+        await Sentry.flush(2000);
+    }
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.info('Shutting down gracefully...');
+    if (bot.client) {
+        bot.client.destroy();
+    }
+    if (sentryEnabled) {
+        await Sentry.flush(2000);
+    }
+    process.exit(0);
+});
+
 process.on('unhandledRejection', (err) => {
     console.error(err);
 });
@@ -75,8 +97,6 @@ const { handleServerIcon } = require('./pages/serverIconHandler.js');
 
 // Constants for imageProxy path lengths
 const EXTERNAL_PROXY_PREFIX_LENGTH = '/imageProxy/external/'.length; // 21
-
-bot.startBot();
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -350,6 +370,45 @@ async function handlePost(req, res) {
                 if (discordID) {
                     await foodpage.handlePost(bot, req, res, discordID, body);
                 }
+            } else if (parsedurl === '/passkey/verify') {
+                const type =
+                    new URL(req.url, 'http://localhost').searchParams.get('type') || 'register';
+                let discordID;
+                const data = JSON.parse(body);
+
+                if (type === 'login') {
+                    // For login, we need to lookup discordID from credential ID
+                    const passkey = auth.querySingle('SELECT discordID FROM passkeys WHERE credentialID = ?', [data.id]);
+
+                    discordID = passkey ? passkey.discordID : null;
+                } else {
+                    discordID = await auth.checkAuth(req, res, true);
+                }
+
+                if (discordID) {
+                    const result = await auth.verifyPasskey(discordID, type, data);
+                    if (result.success && type === 'login') {
+                        const sessionID = auth.createSession(discordID);
+                        res.writeHead(200, {
+                            'Set-Cookie': auth.getCookieHeader(sessionID),
+                            'Content-Type': 'application/json',
+                        });
+                        res.end(JSON.stringify({ success: true, sessionID: sessionID }));
+                    } else {
+                        res.writeHead(result.success ? 200 : 500, {
+                            'Content-Type': 'application/json',
+                        });
+                        res.end(JSON.stringify(result));
+                    }
+                } else {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(
+                        JSON.stringify({
+                            success: false,
+                            error: 'Not authenticated or invalid credential',
+                        })
+                    );
+                }
             } else {
                 await auth.handleLoginRegister(req, res, body);
             }
@@ -368,6 +427,32 @@ async function handleGet(req, res) {
     const args = parsedurl.pathname.replaceAll('?', '/').split('/');
 
     switch (args[1]) {
+        case 'passkey': {
+            if (args[2] === 'options') {
+                const type = parsedurl.searchParams.get('type') || 'register';
+                let discordID;
+                if (type === 'login') {
+                    // For login, we need to lookup discordID by username first
+                    const username = parsedurl.searchParams.get('username');
+                    const user = auth.querySingle('SELECT discordID FROM users WHERE username = ?', [username]);
+
+                    discordID = user ? user.discordID : null;
+                } else {
+                    discordID = await auth.checkAuth(req, res, true);
+                }
+
+                if (discordID || type === 'login') {
+                   const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+                   const rpId = host.split(':')[0];
+                   const options = auth.getPasskeyOptions(discordID, type, rpId);
+                   res.writeHead(200, { 'Content-Type': 'application/json' });
+                   res.end(JSON.stringify(options));
+                } else {                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'User not found or not authenticated' }));
+                }
+            }
+            break;
+        }
         case 'send': {
             const discordID = await auth.checkAuth(req, res);
             if (discordID) await sendpage.sendMessage(bot, req, res, args, discordID);
@@ -714,15 +799,15 @@ async function handleImageProxy(req, res, parsedurl, args) {
     if (args[2] === 'external') {
         const encodedUrl = req.url.slice(EXTERNAL_PROXY_PREFIX_LENGTH).split('?')[0];
         const fullImageUrl = Buffer.from(encodedUrl, 'base64').toString();
-        await imageProxy(res, fullImageUrl, isFull);
+        await imageProxy(req, res, fullImageUrl, isFull);
     } else if (args[2] === 'sticker') {
         const stickerId = args[3].replace(/\.[^.]*$/, '');
-        await imageProxy(res, `https://media.discordapp.net/stickers/${stickerId}.png`, isFull);
+        await imageProxy(req, res, `https://media.discordapp.net/stickers/${stickerId}.png`, isFull);
     } else {
         const urlObj = new URL(req.url, 'http://localhost');
         urlObj.searchParams.delete('full');
         const fullImageUrl = `https://cdn.discordapp.com/${args[2] === 'emoji' ? 'emojis' : 'attachments'}/${args[2] === 'emoji' ? urlObj.pathname.slice(18) : urlObj.pathname.slice(12)}${urlObj.search}`;
-        await imageProxy(res, fullImageUrl, isFull);
+        await imageProxy(req, res, fullImageUrl, isFull);
     }
 }
 
@@ -758,4 +843,10 @@ server.on('error', (err) => {
     }
 });
 
-server.listen(4000);
+bot.startBot().catch((err) => {
+    console.error('Discord bot failed to start:', err.message);
+});
+
+server.listen(4000, () => {
+    console.log('Discross running on port 4000');
+});

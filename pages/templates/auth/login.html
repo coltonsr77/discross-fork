@@ -2,7 +2,6 @@
 <html lang="en" class="page-simple">
   <head>
     {$COMMON_HEAD}
-    <title>Discross - Login</title>
   </head>
 
   <body style="margin: 0" {$WHITE_THEME_ENABLED}>
@@ -30,11 +29,11 @@
           <td>&nbsp;&nbsp;&nbsp;&nbsp;</td>
           <td>
             <form action="/login" method="post">
-              <font size="6" face="'rodin', Arial, Helvetica, sans-serif" color="#dddddd">Login</font><br /><br />
+              <h1 style="font-size: 24px; font-weight: bold; font-family: 'rodin', Arial, Helvetica, sans-serif; color: #dddddd; margin: 0 0 8px 0;">Login</h1><br />
               <font face="'rodin', Arial, Helvetica, sans-serif" color="#dddddd">
                 Username:
                 <br /><br />
-                <div style="padding: 16px; background: #222327; max-width: 300px; width: 100%"><input type="text" name="username" id="username" value="" style=" color: #dddddd; background: #222327; border: none; width: 100%; outline: none; " placeholder="Username" /></div>
+                <div style="padding: 16px; background: #222327; max-width: 300px; width: 100%"><input type="text" name="username" id="username" value="" style=" color: #dddddd; background: #222327; border: none; width: 100%; outline: none; " placeholder="Username" autocomplete="username webauthn" /></div>
                 <br />
                 Password:
                 <br /><br />
@@ -47,15 +46,89 @@
                 <a href="/forgot.html" style="text-decoration: none">
                   <font color="#999999" size="4" face="'rodin', Arial, Helvetica, sans-serif">Forgot username or password</font>
                 </a>
-                <br />
-                {$ERROR}<br />
-                <input type="hidden" id="redirect" name="redirect" value="{$REDIRECT_URL}" />
+                <br /><br />
                 <input type="submit" style=" color: #ffffff; height: 44px; width: 150px; border: none; background: #5865f2; border-radius: 8px; font-family: 'rodin', Arial, Helvetica, sans-serif; font-size: 16px; font-weight: 500; cursor: pointer; " value="Login" />
-              </font>
-            </form>
-          </td>
-        </tr>
-      </table>
-    </div>
-  </body>
-</html>
+                </font>
+                </form>
+                </td>
+                </tr>
+                </table>
+                </div>
+                <script>
+                (function() {
+                    async function doPasskeyLogin(options, isConditional) {
+                        try {
+                            console.log('Starting passkey login, conditional:', isConditional, 'rp:', options.rp.id);
+                            
+                            // Prepare options for navigator.credentials.get
+                            var getOptions = {
+                                publicKey: {
+                                    ...options,
+                                    challenge: new window.Uint8Array(options.challenge)
+                                }
+                            };
+                            
+                            if (options.allowCredentials) {
+                                for (var i = 0; i < options.allowCredentials.length; i++) {
+                                    getOptions.publicKey.allowCredentials[i].id = new window.Uint8Array(options.allowCredentials[i].id);
+                                }
+                            }
+
+                            if (isConditional) {
+                                getOptions.mediation = 'conditional';
+                            }
+
+                            var assertion = await navigator.credentials.get(getOptions);
+                            if (!assertion) return;
+
+                            console.log('Assertion received, verifying...');
+                            var data = {
+                                id: assertion.id,
+                                rawId: btoa(String.fromCharCode.apply(null, new window.Uint8Array(assertion.rawId))),
+                                type: assertion.type,
+                                response: {
+                                    authenticatorData: btoa(String.fromCharCode.apply(null, new window.Uint8Array(assertion.response.authenticatorData))),
+                                    clientDataJSON: btoa(String.fromCharCode.apply(null, new window.Uint8Array(assertion.response.clientDataJSON))),
+                                    signature: btoa(String.fromCharCode.apply(null, new window.Uint8Array(assertion.response.signature)))
+                                }
+                            };
+
+                            var verify = await fetch('/passkey/verify?type=login', {
+                                method: 'POST',
+                                body: JSON.stringify(data),
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+
+                            var result = await verify.json();
+                            if (verify.ok && result.success) {
+                                window.location.href = '/server/?sessionID=' + encodeURIComponent(result.sessionID) + '#end';
+                            } else {
+                                if (!isConditional) alert('Passkey login failed: ' + (result.error || 'Unknown error'));
+                            }
+                        } catch (err) {
+                            if (err.name !== 'NotAllowedError' && !isConditional) {
+                                console.error('Passkey error:', err);
+                                alert('Error: ' + err.message);
+                            }
+                        }
+                    }
+
+                    // Conditional UI (Autofill) / Auto-trigger
+                    if (window.PublicKeyCredential && PublicKeyCredential.isConditionalMediationAvailable) {
+                        PublicKeyCredential.isConditionalMediationAvailable().then(function(available) {
+                            if (available) {
+                                fetch('/passkey/options?type=login')
+                                    .then(function(res) { return res.json(); })
+                                    .then(function(options) {
+                                        doPasskeyLogin(options, true);
+                                    })
+                                    .catch(function(err) {
+                                        console.error('Failed to fetch passkey options:', err);
+                                    });
+                            }
+                        });
+                    }
+                })();
+                </script>
+                </body>
+                </html>

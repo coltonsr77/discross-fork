@@ -2,7 +2,6 @@
 <html lang="en" class="page-food">
   <head>
     {$COMMON_HEAD}
-    <title>Discross - Order History</title>
   </head>
   <body style="margin: 0" {$WHITE_THEME_ENABLED}>
     <div id="wrapper">
@@ -30,8 +29,8 @@
       <hr style="margin: 0" />
       <br />
       <div class="food-container">
-        <font size="6" face="'rodin', Arial, Helvetica, sans-serif" color="#dddddd"><b>Order History</b></font><br /><br />
-        {$NOTICE}
+        <h1 style="font-size: 24px; font-weight: bold; font-family: 'rodin', Arial, Helvetica, sans-serif; color: #dddddd; margin: 0 0 8px 0;">Order History</h1><br />
+        <div class="food-card">
         <div id="orders-list">{$ORDERS}</div>
         <div style="margin-top: 24px">
           <a href="/food/" class="food-btn">Order Again</a>

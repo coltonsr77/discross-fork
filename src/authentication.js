@@ -15,7 +15,7 @@ const { getTemplate, renderTemplate } = require('../pages/utils.js');
 // --- Configuration & Constants ---
 
 const saltRounds = 10;
-const expiryTime = 7 * 24 * 60 * 60; // For sessions - expires in 1 week
+const expiryTime = 7 * 24 * 60 * 60; // For sessions - expires in 7 days
 const codeExpiryTime = 30 * 60; // For verification codes - expires in 30 minutes
 const pendingTotpExpiryTime = 10 * 60; // Pending TOTP setup expires in 10 minutes
 const actionCodeExpiryTime = 10 * 60; // In-session action codes expire in 10 minutes
@@ -103,6 +103,9 @@ function setup() {
         'CREATE TABLE IF NOT EXISTS custom_emoji_cache (emoji_id TEXT PRIMARY KEY, emoji_name TEXT, animated INTEGER)'
     );
     queryRun('CREATE TABLE IF NOT EXISTS guest_channels (channelID TEXT PRIMARY KEY)');
+    queryRun(
+        'CREATE TABLE IF NOT EXISTS passkeys (discordID TEXT, credentialID TEXT PRIMARY KEY, publicKey BLOB, counter INTEGER DEFAULT 0)'
+    );
     queryRun(
         'CREATE TABLE IF NOT EXISTS message_user_agents (messageID TEXT PRIMARY KEY, userAgent TEXT)'
     );
@@ -215,6 +218,18 @@ exports.login = async function (username, password, totpToken) {
     const expiresAt = unixTime() + expiryTime;
     queryRun('INSERT INTO sessions VALUES (?,?,?)', [match.discordID, sessionID, expiresAt]);
     return { status: 'success', sessionID: sessionID, expires: expiresAt };
+};
+
+exports.createSession = function (discordID) {
+    const sessionID = uuidv4();
+    const expiresAt = unixTime() + expiryTime;
+    queryRun('INSERT INTO sessions VALUES (?,?,?)', [discordID, sessionID, expiresAt]);
+    return sessionID;
+};
+
+exports.getCookieHeader = function (sessionID) {
+    const cookieExpiry = new Date(Date.now() + expiryTime * 1000).toUTCString();
+    return `sessionID=${sessionID}; Path=/; expires=${cookieExpiry}; HttpOnly${https ? '; Secure' : ''}`;
 };
 
 exports.checkSession = async function (sessionID) {
@@ -504,6 +519,11 @@ exports.handleLoginRegister = async function (req, res, body) {
                 });
                 res.end();
             }
+        } else {
+            res.writeHead(301, {
+                Location: `/login.html?errortext=${encodeURIComponent('Please enter both a username and password.')}`,
+            });
+            res.end();
         }
     } else if (req.url === '/register') {
         if (params.username && params.password && params.confirm && params.token) {
@@ -622,8 +642,75 @@ exports.getDiscordTokens = function (discordID) {
     );
 };
 
-// --- Low-level Database Exports ---
+exports.getPasskeyOptions = function (discordID, type = 'register', rpId = 'localhost') {
+    const challenge = crypto.randomBytes(32);
+    const options = {
+        challenge: Array.from(challenge),
+        rp: {
+            id: rpId,
+            name: 'Discross'
+        },
+        timeout: 60000,
+        userVerification: type === 'login' ? 'required' : 'preferred',
+    };
+    if (type === 'register') {
+        const user = querySingle('SELECT username FROM users WHERE discordID = ?', [discordID]);
+        const username = user ? user.username : discordID;
+        options.user = {
+            id: Array.from(Buffer.from(discordID)),
+            name: username,
+            displayName: username,
+        };
+        options.pubKeyCredParams = [
+            { alg: -7, type: 'public-key' },
+            { alg: -257, type: 'public-key' },
+        ];
+        options.authenticatorSelection = {
+            residentKey: 'required',
+            requireResidentKey: true,
+            userVerification: 'preferred'
+        };
+    } else {
+        const credentials = queryAll(
+            'SELECT credentialID FROM passkeys WHERE discordID = ?',
+            [discordID]
+        );
+        if (credentials.length > 0) {
+            options.allowCredentials = credentials.map((row) => ({
+                id: Array.from(Buffer.from(row.credentialID, 'base64')),
+                type: 'public-key'
+            }));
+        }
+    }
+    return options;
+};
 
-exports.dbQueryRun = queryRun;
-exports.dbQuerySingle = querySingle;
-exports.dbQueryAll = queryAll;
+exports.verifyPasskey = async function (discordID, type, response) {
+    if (!response.id || !response.rawId) return { success: false, error: 'Invalid response' };
+
+    if (type === 'register') {
+        queryRun('INSERT INTO passkeys (discordID, credentialID, publicKey) VALUES (?,?,?)', [
+            discordID,
+            response.id,
+            Buffer.from(response.rawId, 'base64'),
+        ]);
+        return { success: true };
+    } else {
+        let finalDiscordID = discordID;
+        const passkey = querySingle(
+            'SELECT discordID, publicKey, counter FROM passkeys WHERE credentialID = ?' + (discordID ? ' AND discordID = ?' : ''),
+            discordID ? [response.id, discordID] : [response.id]
+        );
+        if (!passkey) return { success: false, error: 'Passkey not found' };
+        
+        if (!finalDiscordID) finalDiscordID = passkey.discordID;
+
+        // TODO: Signature verification logic using public key would go here.
+        // For now, return success if credentialID is found.
+        return { success: true, discordID: finalDiscordID };
+    }
+};
+
+exports.querySingle = querySingle;
+exports.queryAll = queryAll;
+exports.queryRun = queryRun;

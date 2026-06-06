@@ -7,7 +7,8 @@ const auth = require('./authentication.js');
 const connectionHandler = require('./connectionHandler.js');
 
 const cachelength = 100; // Length of message history
-const msghistory = {};
+const msghistory = new Map();
+const MSGHISTORY_MAX_CHANNELS = 100; // Max number of channels to keep in history cache
 
 // Optionally enable Guild Members Intent for automatic server sync
 const guildMembersIntentEnabled = process.env.GUILD_MEMBERS_INTENT === 'true';
@@ -31,12 +32,12 @@ client.on('clientReady', () => {
 });
 
 client.on('messageCreate', async function (msg) {
-    if (msghistory[msg.channel.id] && !msghistory[msg.channel.id].get(msg.id)) {
-        msghistory[msg.channel.id].set(msg.id, msg);
+    if (msghistory.has(msg.channel.id) && !msghistory.get(msg.channel.id).get(msg.id)) {
+        msghistory.get(msg.channel.id).set(msg.id, msg);
 
-        if (msghistory[msg.channel.id].size > cachelength) {
+        if (msghistory.get(msg.channel.id).size > cachelength) {
             // Delete the oldest entry (Maps preserve insertion order)
-            msghistory[msg.channel.id].delete(msghistory[msg.channel.id].keys().next().value);
+            msghistory.get(msg.channel.id).delete(msghistory.get(msg.channel.id).keys().next().value);
         }
     }
 
@@ -95,7 +96,7 @@ client.on('messageCreate', async function (msg) {
     // Auto-sync server membership when a registered user sends a message
     // This ensures active servers are added to the user's list without manual sync.
     if (msg.guild && msg.author && !msg.author.bot) {
-        const user = auth.dbQuerySingle('SELECT discordID FROM users WHERE discordID=?', [
+        const user = auth.querySingle('SELECT discordID FROM users WHERE discordID=?', [
             msg.author.id,
         ]);
         if (user) {
@@ -104,13 +105,13 @@ client.on('messageCreate', async function (msg) {
             ]);
         }
     }
-});
+    });
 
-// Auto-sync server membership when GuildMembers intent is enabled
-if (guildMembersIntentEnabled) {
+    // Auto-sync server membership when GuildMembers intent is enabled
+    if (guildMembersIntentEnabled) {
     client.on('guildMemberAdd', (member) => {
         // Only add the server if the user is a registered Discross user
-        const user = auth.dbQuerySingle('SELECT discordID FROM users WHERE discordID=?', [
+        const user = auth.querySingle('SELECT discordID FROM users WHERE discordID=?', [
             member.user.id,
         ]);
         if (user) {
@@ -121,17 +122,25 @@ if (guildMembersIntentEnabled) {
     });
 
     client.on('guildMemberRemove', (member) => {
-        auth.dbQueryRun('DELETE FROM servers WHERE serverID=? AND discordID=?', [
+        auth.queryRun('DELETE FROM servers WHERE serverID=? AND discordID=?', [
             member.guild.id,
             member.user.id,
         ]);
     });
-}
+    }
 
 exports.startBot = async function () {
     const token = process.env.DISCORD_TOKEN;
     if (token) {
-        client.login(token);
+        return new Promise((resolve, reject) => {
+            client.once('clientReady', () => {
+                resolve(client);
+            });
+            client.once('error', (err) => {
+                reject(err);
+            });
+            client.login(token).catch(reject);
+        });
     } else {
         console.error(
             'No token found! Please set the DISCORD_TOKEN environment variable to your bot token.'
@@ -141,8 +150,8 @@ exports.startBot = async function () {
 };
 
 exports.addToCache = function (msg) {
-    if (msghistory[msg.channel.id]) {
-        msghistory[msg.channel.id].set(msg.id, msg);
+    if (msghistory.has(msg.channel.id)) {
+        msghistory.get(msg.channel.id).set(msg.id, msg);
     }
 };
 
@@ -155,19 +164,27 @@ exports.getHistoryCached = async function (chnl) {
     if (!chnl || !chnl.id) {
         return [];
     }
-    if (!msghistory[chnl.id]) {
+    if (!msghistory.has(chnl.id)) {
         try {
+            // FIFO eviction for channels
+            if (msghistory.size >= MSGHISTORY_MAX_CHANNELS) {
+                msghistory.delete(msghistory.keys().next().value);
+            }
+
             // Fetch messages - Discord.js will try to populate member data automatically if available in cache
             const messagearray = await chnl.messages.fetch({ limit: cachelength });
-            msghistory[chnl.id] = messagearray.sort(
-                (messageA, messageB) => messageA.createdTimestamp - messageB.createdTimestamp
+            msghistory.set(
+                chnl.id,
+                messagearray.sort(
+                    (messageA, messageB) => messageA.createdTimestamp - messageB.createdTimestamp
+                )
             );
         } catch (err) {
             console.error(`Failed to fetch messages for channel ${chnl.id}:`, err);
             return [];
         }
     }
-    return Array.from(msghistory[chnl.id].values());
+    return Array.from(msghistory.get(chnl.id).values());
 };
 
 exports.client = client;
