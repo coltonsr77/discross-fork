@@ -7,12 +7,14 @@ const { getOrCreateWebhook } = require('./webhookCache');
 const {
     isValidSnowflake,
     isBotReady,
+    isCrossSiteRequest,
     getBaseUrl,
     resolveMentions,
     resolveNameMentions,
     mentionsToReadableText,
     buildAllowedMentions,
     canMentionEveryoneIn,
+    sanitizeWebhookUsername,
     renderTemplate,
     render,
     getTemplate,
@@ -24,6 +26,18 @@ const { parseUserAgent } = require('./userAgentUtils');
 exports.sendMessage = async function sendMessage(bot, req, req_res, args, discordID) {
     const baseUrl = getBaseUrl(req);
     try {
+        // Reject cross-site initiated sends (CSRF): the Lax session cookie would
+        // otherwise let a hostile page make a logged-in user post on their behalf.
+        if (isCrossSiteRequest(req)) {
+            req_res.writeHead(403, { 'Content-Type': 'text/html' });
+            req_res.end(
+                render('misc/error-text', {
+                    MESSAGE: 'Request blocked for security reasons.',
+                })
+            );
+            return;
+        }
+
         const parsedurl = new URL(req.url, 'http://localhost');
         const query = Object.fromEntries(parsedurl.searchParams);
 
@@ -134,11 +148,14 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
             const userAgentStr = req.headers['user-agent'];
 
             // Reverted to plain content sending by default
-            const finalMessage = replyInfo + resolvedMsg;
+            // Cap at 2000 characters (Discord max message length)
+            const rawMessage = replyInfo + resolvedMsg;
+            const finalMessage =
+                rawMessage.length > 2000 ? rawMessage.substring(0, 2000) : rawMessage;
 
             const sendOptions = {
                 content: finalMessage,
-                username: normalizeWeirdUnicode(member.displayName || member.user.tag),
+                username: sanitizeWebhookUsername(member.displayName || member.user.tag),
                 avatarURL: member.user.avatarURL() || member.user.defaultAvatarURL,
                 // Webhooks bypass the member's own mention permissions, so every
                 // ping is re-checked against what this member could do natively.

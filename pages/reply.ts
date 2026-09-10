@@ -5,11 +5,13 @@ const { convertEmoji } = require('./emojiConvert');
 const { getOrCreateWebhook } = require('./webhookCache');
 const {
     isBotReady,
+    isCrossSiteRequest,
     resolveMentions,
     resolveNameMentions,
     mentionsToReadableText,
     buildAllowedMentions,
     canMentionEveryoneIn,
+    sanitizeWebhookUsername,
     getTemplate,
     renderTemplate,
     render,
@@ -17,6 +19,12 @@ const {
 
 exports.replyMessage = async function replyMessage(bot, req, res, args, discordID) {
     try {
+        // Reject cross-site initiated replies (CSRF); see isCrossSiteRequest.
+        if (isCrossSiteRequest(req)) {
+            res.writeHead(403, { 'Content-Type': 'text/html' });
+            res.end(render('misc/error-text', { MESSAGE: 'Request blocked for security reasons.' }));
+            return;
+        }
         const parsedurl = new URL(req.url, 'http://localhost');
         if (
             parsedurl.searchParams.get('message') !== null &&
@@ -101,11 +109,15 @@ exports.replyMessage = async function replyMessage(bot, req, res, args, discordI
                 .then((m) => m.displayName || m.user.username)
                 .catch(() => reply_message.author.username);
 
-            const processedmessage = `> Replying to ${reply_message_content} from ${author_name}: [jump](https://discord.com/channels/${channel.guild.id}/${channel.id}/${reply_message.id})\n${resolvedMsg}`;
+            const rawProcessedMessage = `> Replying to ${reply_message_content} from ${author_name}: [jump](https://discord.com/channels/${channel.guild.id}/${channel.id}/${reply_message.id})\n${resolvedMsg}`;
+            const processedmessage =
+                rawProcessedMessage.length > 2000
+                    ? rawProcessedMessage.substring(0, 2000)
+                    : rawProcessedMessage;
 
             const sendOptions: any = {
                 content: processedmessage,
-                username: member.displayName || member.user.tag,
+                username: sanitizeWebhookUsername(member.displayName || member.user.tag),
                 avatarURL: member.user.avatarURL() || member.user.defaultAvatarURL,
                 // Webhooks bypass the member's own mention permissions, so every
                 // ping is re-checked against what this member could do natively.
