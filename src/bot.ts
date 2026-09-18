@@ -73,7 +73,8 @@ client.on('clientReady', async () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-    if (interaction.isChatInputCommand()) {
+    try {
+        if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 
         if (commandName === 'connect') {
@@ -227,9 +228,38 @@ client.on('interactionCreate', async (interaction) => {
             });
         } else if (customId.startsWith('mail_block:')) {
             const blockEmail = customId.split(':').slice(1).join(':');
-            auth.addMailBlock(interaction.user.id, blockEmail);
-            return interaction.reply({
-                content: `Successfully blocked \`${blockEmail}\`.`,
+            const alreadyBlocked = auth.isMailBlocked(interaction.user.id, blockEmail);
+
+            if (alreadyBlocked) {
+                auth.removeMailBlock(interaction.user.id, blockEmail);
+            } else {
+                auth.addMailBlock(interaction.user.id, blockEmail);
+            }
+            const nowBlocked = !alreadyBlocked;
+
+            const rows = interaction.message.components.map((row) =>
+                new Discord.ActionRowBuilder().addComponents(
+                    row.components.map((component) => {
+                        const builder = Discord.ButtonBuilder.from(component);
+                        if (component.customId === customId) {
+                            builder
+                                .setLabel(nowBlocked ? 'Unblock Sender' : 'Block Sender')
+                                .setStyle(
+                                    nowBlocked
+                                        ? Discord.ButtonStyle.Secondary
+                                        : Discord.ButtonStyle.Danger
+                                );
+                        }
+                        return builder;
+                    })
+                )
+            );
+            await interaction.update({ components: rows }).catch(() => {});
+
+            return interaction.followUp({
+                content: nowBlocked
+                    ? `Successfully blocked \`${blockEmail}\`.`
+                    : `Successfully unblocked \`${blockEmail}\`.`,
                 flags: Discord.MessageFlags.Ephemeral,
             });
         } else if (customId === 'mail_delete') {
@@ -366,6 +396,17 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.editReply({ content: `Failed to send reply: ${res.error}` });
             }
         }
+    }
+    } catch (err) {
+        if (
+            err.code === 10062 ||
+            err.code === 40060 ||
+            (err.message && (err.message.includes('10062') || err.message.includes('Unknown interaction')))
+        ) {
+            console.warn('Interaction expired or already handled:', err.message);
+            return;
+        }
+        console.error('Error handling interaction:', err);
     }
 });
 
@@ -733,7 +774,20 @@ exports.sendDM = async function (discordID, message) {
         await user.send(message);
         return { success: true };
     } catch (err) {
-        console.error('Failed to send DM to', discordID, ':', err);
+        if (
+            err &&
+            (err.code === 50278 ||
+                err.code === 50007 ||
+                (err.message &&
+                    (err.message.includes('no mutual guilds') ||
+                        err.message.includes('Cannot send messages to this user'))))
+        ) {
+            console.warn(
+                `Could not send DM to ${discordID}: user DMs disabled or no mutual guilds (${err.code || err.message})`
+            );
+        } else {
+            console.error('Failed to send DM to', discordID, ':', err);
+        }
         return { success: false, error: err.message || 'Failed to send Discord DM.' };
     }
 };
