@@ -28,7 +28,7 @@
         "snowtransfer": "^0.15.0",
         "turndown": "^7.2.4",
         "ua-parser-js": "^2.0.8",
-        "undici": "^6.27.0",
+        "undici": "^8.10.0",
         "uuid": "^13.0.0",
         "ws": "^8.17.0"
     },
