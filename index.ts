@@ -764,7 +764,7 @@ async function handleGet(req, res) {
             await stockspage.processStocks(req, res);
             break;
         case 'search':
-            await searchpage.processSearch(req, res);
+            await searchpage.processSearch(bot, req, res);
             break;
         case 'tv':
             await tvpage.processTV(req, res);
@@ -985,6 +985,15 @@ async function handleImageProxy(req, res, parsedurl, args) {
             req,
             res,
             `https://media.discordapp.net/stickers/${stickerId}.png`,
+            isFull
+        );
+    } else if (args[2] === 'app-icon') {
+        const appId = args[3];
+        const iconFile = args[4] || '';
+        await imageProxy(
+            req,
+            res,
+            `https://cdn.discordapp.com/app-icons/${appId}/${iconFile}`,
             isFull
         );
     } else {

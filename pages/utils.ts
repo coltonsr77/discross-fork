@@ -188,7 +188,19 @@ function getBaseUrl(req) {
  * @param {object} options - SEO options (title, description, canonical, type, image).
  * @returns {string}
  */
-function generateSEOMetadata(req, options = {}) {
+function generateSEOMetadata(
+    req,
+    options: {
+        title?: string;
+        description?: string;
+        canonical?: string;
+        type?: string;
+        image?: string;
+        noindex?: boolean;
+        schemaType?: string;
+        schemaExtra?: Record<string, any>;
+    } = {}
+) {
     const baseUrl = getBaseUrl(req);
     const path = new URL(req.url, 'http://localhost').pathname;
     const url = baseUrl + path;
@@ -196,7 +208,7 @@ function generateSEOMetadata(req, options = {}) {
     const title = options.title || 'Discross - Use Discord Anywhere';
     const description =
         options.description ||
-        'Discross is a universal Discord client that brings modern communication to any device with a web browser. Access Discord, check weather, read news, view sports scores, and more on everything from retro consoles to modern smartphones.';
+        'Discross is a bot designed to view Discord work on any device with a basic HTML web browser. Access Discord on retro consoles, old computers, and modern devices.';
     const canonical = options.canonical || url;
     const type = options.type || 'website';
     const image = options.image || baseUrl + '/resources/logo_full.png';
