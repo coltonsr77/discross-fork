@@ -902,6 +902,8 @@ async function handleDiscordOAuth(req, res, parsedurl) {
                     tokenData.refresh_token,
                     Math.floor(Date.now() / 1000) + (tokenData.expires_in || 0)
                 );
+                // Drop any stale "unverified" result so the new token is checked immediately
+                require('./pages/ageVerification').clearAgeVerificationCache(discordID);
             } else {
                 throw new Error('Failed to exchange code: ' + JSON.stringify(tokenData));
             }
@@ -950,7 +952,16 @@ async function handleDiscordOAuth(req, res, parsedurl) {
                 }
             }
 
-            if (query.get('state') === 'sync') {
+            const state = query.get('state') || '';
+            const returnPath = state.startsWith('return:') ? state.slice(7) : '';
+            if (
+                returnPath.startsWith('/') &&
+                !returnPath.startsWith('//') &&
+                !returnPath.includes('\\')
+            ) {
+                res.writeHead(302, { Location: returnPath });
+                res.end();
+            } else if (state === 'sync') {
                 res.writeHead(200, { 'Content-Type': 'text/html' });
                 res.end(getTemplate('sync-complete-script', 'misc'));
             } else {
