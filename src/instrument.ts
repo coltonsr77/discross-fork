@@ -59,8 +59,19 @@ if (process.env.SENTRY_DSN) {
             if (
                 message.includes('rate limited') ||
                 message.includes('limitate') ||
-                (error && error.status === 429) ||
+                message.includes('limitadas') ||
+                (error &&
+                    (error.status === 429 || error.httpStatus === 429 || error.code === 429)) ||
                 (error && error.code === 20028)
+            ) {
+                return null;
+            }
+
+            // Ignore aborted HTTP requests (e.g. client aborted / timeout on Discord sends)
+            if (
+                (error && error.name === 'AbortError') ||
+                message.includes('AbortError') ||
+                message.includes('This operation was aborted')
             ) {
                 return null;
             }
@@ -69,13 +80,18 @@ if (process.env.SENTRY_DSN) {
             const cause = error && error.cause;
             const causeMessage = (cause && (cause.message || cause.toString())) || '';
             if (
-                (error && (error.name === 'ConnectTimeoutError' || error.code === 'UND_ERR_CONNECT_TIMEOUT')) ||
-                (cause && (cause.name === 'ConnectTimeoutError' || cause.code === 'UND_ERR_CONNECT_TIMEOUT')) ||
+                (error &&
+                    (error.name === 'ConnectTimeoutError' ||
+                        error.code === 'UND_ERR_CONNECT_TIMEOUT')) ||
+                (cause &&
+                    (cause.name === 'ConnectTimeoutError' ||
+                        cause.code === 'UND_ERR_CONNECT_TIMEOUT')) ||
                 message.includes('Connect Timeout Error') ||
                 causeMessage.includes('Connect Timeout Error') ||
                 message.includes('getaddrinfo EAI_AGAIN discord.com') ||
                 causeMessage.includes('getaddrinfo EAI_AGAIN discord.com') ||
-                (message.includes('fetch failed') && (causeMessage.includes('timeout') || causeMessage.includes('discord.com')))
+                (message.includes('fetch failed') &&
+                    (causeMessage.includes('timeout') || causeMessage.includes('discord.com')))
             ) {
                 return null;
             }
@@ -139,4 +155,3 @@ if (process.env.SENTRY_DSN) {
         },
     });
 }
-

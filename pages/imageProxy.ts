@@ -5,7 +5,8 @@ const net = require('net');
 const dns = require('dns').promises;
 const dnsLookup = require('dns').lookup;
 const sharp = require('sharp');
-const { getTemplate } = require('./utils'); // Assuming utils.js exists and exports getTemplate
+const { getTemplate } = require('./utils');
+const { isLegacyClient } = require('./userAgentUtils');
 
 // --- SSRF protection ----------------------------------------------------------
 // The /imageProxy/external/ endpoint fetches arbitrary client-supplied URLs.
@@ -23,8 +24,13 @@ function isPrivateIp(ip) {
     if (type === 6) {
         const lower = ip.toLowerCase();
         if (lower === '::1' || lower === '::') return true;
-        if (lower.startsWith('fe80') || lower.startsWith('fc') || lower.startsWith('fd'))
-            return true;
+        if (/^fe[89ab]/.test(lower) || lower.startsWith('fc') || lower.startsWith('fd'))
+            return true; // link-local fe80::/10, unique-local fc00::/7
+        // NAT64 (64:ff9b::/96) embeds an IPv4 destination the gateway will reach.
+        if (lower.startsWith('64:ff9b:')) {
+            const embedded = extractMappedIpv4(lower.replace(/^64:ff9b:(0:)*:?/, '::'));
+            return embedded ? isPrivateIpv4(embedded) : true;
+        }
         // IPv4-mapped / -compatible addresses (::ffff:a.b.c.d or the hex form
         // ::ffff:7f00:1) resolve to a v4 destination — validate the embedded v4.
         const embedded = extractMappedIpv4(lower);
@@ -59,6 +65,8 @@ function isPrivateIpv4(ip) {
     if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
     if (a === 192 && b === 168) return true; // 192.168/16
     if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a === 192 && b === 0 && p[2] === 0) return true; // IETF protocol assignments
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking 198.18/15
     if (a >= 224) return true; // multicast / reserved
     return false;
 }
@@ -115,6 +123,15 @@ const imageCache = new Map();
 // Browser-side cache lifetime for proxied images (24 hours)
 const CACHE_CONTROL = 'public, max-age=86400';
 
+// Upstream bodies are buffered in memory for conversion, so cap their size and
+// how long we wait for them; otherwise one URL pointing at a huge or endless
+// response could exhaust memory or tie up sockets.
+const MAX_UPSTREAM_BYTES = 25 * 1024 * 1024;
+const UPSTREAM_TIMEOUT_MS = 20 * 1000;
+// Decoded size matters as much as download size: a small file can expand to a
+// huge bitmap. sharp's default limit is ~268 megapixels.
+const MAX_INPUT_PIXELS = 64 * 1024 * 1024;
+
 function cacheSet(key, value) {
     if (imageCache.size >= MAX_CACHE_SIZE) {
         // Delete the oldest (first-inserted) entry
@@ -134,8 +151,23 @@ function detectBufferMimeType(buf) {
     return 'image/gif';
 }
 
+/**
+ * Browsers that can show WebP say so in their image Accept header; the Wii,
+ * 3DS, PSP and old desktop browsers never do. Those keep the small 256-colour
+ * GIFs, while modern browsers get WebP sized for Discord's display limits
+ * (550x350 inline, at 2x for high-DPI screens).
+ */
+function wantsModernImage(req) {
+    const accept = String(req?.headers?.accept || '');
+    return /image\/webp/i.test(accept) && !isLegacyClient(req?.headers?.['user-agent']);
+}
+
+const LEGACY_SIZE = { inline: 256, full: 1024 };
+const MODERN_SIZE = { inline: { width: 1100, height: 700 }, full: { width: 2560, height: 2560 } };
+
 exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) {
-    const cacheKey = fullSize ? URL + ':full' : URL;
+    const modern = wantsModernImage(req);
+    const cacheKey = (fullSize ? URL + ':full' : URL) + (modern ? ':webp' : '');
     // Serve from in-memory cache if available
     if (imageCache.has(cacheKey)) {
         const cached = imageCache.get(cacheKey);
@@ -145,6 +177,7 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
             'Content-Type': contentType,
             'Content-Length': cachedBuffer.length,
             'Cache-Control': CACHE_CONTROL,
+            Vary: 'Accept, User-Agent',
         });
         res.end(cachedBuffer);
         return;
@@ -163,6 +196,7 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
 
     const options = {
         lookup: safeLookup,
+        timeout: UPSTREAM_TIMEOUT_MS,
         headers: {
             'User-Agent':
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -186,8 +220,24 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
                 res.end(EMPTY_GIF);
                 return;
             }
+            const declaredLength = parseInt(proxyRes.headers['content-length'] || '0', 10);
+            if (declaredLength > MAX_UPSTREAM_BYTES) {
+                proxyRes.destroy();
+                res.writeHead(200, {
+                    'Content-Type': 'image/gif',
+                    'Content-Length': EMPTY_GIF.length,
+                });
+                res.end(EMPTY_GIF);
+                return;
+            }
             const chunks = [];
+            let receivedBytes = 0;
             proxyRes.on('data', (chunk) => {
+                receivedBytes += chunk.length;
+                if (receivedBytes > MAX_UPSTREAM_BYTES) {
+                    proxyRes.destroy(new Error('Upstream image too large'));
+                    return;
+                }
                 chunks.push(chunk);
             });
             proxyRes
@@ -202,42 +252,32 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
                         return;
                     }
                     try {
-                        let processedBuffer;
-                        if (fullSize) {
-                            // Still convert to GIF for compatibility, but don't resize down to 256
-                            // We might still want to cap it at a reasonable "full" size for legacy browsers, e.g. 1024
-                            processedBuffer = await sharp(buffer, { animated: true })
-                                .resize({
-                                    width: 1024,
-                                    height: 1024,
-                                    fit: 'inside',
-                                    withoutEnlargement: true,
-                                })
-                                .toFormat('gif', { colors: 256 })
-                                .toBuffer()
-                                .catch(() => {
-                                    console.warn(
-                                        'Could not convert full-size image, sending original'
-                                    );
-                                    return buffer;
-                                });
-                        } else {
-                            // Resize options: cap all images at 256x256 to keep transfers small for Wii Internet Channel
-                            const resizeOptions = {
-                                width: 256,
-                                height: 256,
-                                fit: 'inside',
-                                withoutEnlargement: true,
-                            };
-                            processedBuffer = await sharp(buffer, { animated: true })
-                                .resize(resizeOptions)
-                                .toFormat('gif', { colors: 256 })
-                                .toBuffer()
-                                .catch(() => {
-                                    console.warn('Could not convert image, sending original');
-                                    return buffer;
-                                });
-                        }
+                        const image = sharp(buffer, {
+                            animated: true,
+                            limitInputPixels: MAX_INPUT_PIXELS,
+                        });
+                        const bounds = modern
+                            ? MODERN_SIZE[fullSize ? 'full' : 'inline']
+                            : {
+                                  width: LEGACY_SIZE[fullSize ? 'full' : 'inline'],
+                                  height: LEGACY_SIZE[fullSize ? 'full' : 'inline'],
+                              };
+                        const resized = image.resize({
+                            ...bounds,
+                            fit: 'inside',
+                            withoutEnlargement: true,
+                        });
+                        const processedBuffer = await (
+                            modern
+                                ? resized.webp({ quality: fullSize ? 90 : 82, effort: 4 })
+                                : // GIF keeps transfers small for the Wii Internet Channel.
+                                  resized.toFormat('gif', { colors: 256 })
+                        )
+                            .toBuffer()
+                            .catch(() => {
+                                console.warn('Could not convert image, sending original');
+                                return buffer;
+                            });
                         let contentType = 'image/gif';
                         if (processedBuffer === buffer) {
                             contentType = detectBufferMimeType(buffer);
@@ -250,6 +290,7 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
                             'Content-Type': contentType,
                             'Content-Length': processedBuffer.length,
                             'Cache-Control': CACHE_CONTROL,
+                            Vary: 'Accept, User-Agent',
                         });
                         res.end(processedBuffer);
                     } catch (error) {
@@ -264,6 +305,7 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
                 })
                 .on('error', (err) => {
                     console.log('Error fetching image:', err.message || err);
+                    if (res.headersSent) return;
                     res.writeHead(500, { 'Content-Type': 'text/html' });
                     if (
                         (err.message || err).toString().includes('error reading from remote stream')
@@ -274,8 +316,12 @@ exports.imageProxy = async function imageProxy(req, res, URL, fullSize = false) 
                     }
                 });
         })
+        .on('timeout', function () {
+            this.destroy(new Error('Upstream image request timed out'));
+        })
         .on('error', (err) => {
             console.log('Image proxy request error:', err.message || err);
+            if (res.headersSent) return;
             res.writeHead(500, { 'Content-Type': 'text/html' });
             if ((err.message || err).toString().includes('error reading from remote stream')) {
                 res.end(getTemplate('proxy-timeout-error', 'misc'));

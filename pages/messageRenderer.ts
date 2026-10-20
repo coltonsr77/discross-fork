@@ -2,44 +2,41 @@
 
 const escape = require('escape-html');
 const he = require('he');
-const { PermissionFlagsBits, MessageReferenceType, UserFlags } = require('discord');
+const { MessageReferenceType, UserFlags } = require('discord.js');
 const { renderDiscordMarkdown } = require('./discordMarkdown');
-const { getDisplayName, getMemberColor, ensureMemberData } = require('./memberUtils');
 const {
-    getClientIP,
-    getTimezoneFromIP,
+    getDisplayName,
+    getDisplayAvatarURL,
+    getMemberColor,
+    ensureMemberData,
+} = require('./memberUtils');
+const {
     formatDateWithTimezone,
     formatDateSeparator,
     areDifferentDays,
     formatForwardedTimestamp,
     replaceDiscordTimestamps,
 } = require('../src/timezoneUtils');
-const { processEmbeds } = require('./embedUtils');
+const { processEmbeds, plainEmbed, embedType } = require('./embedUtils');
+const { renderMosaic, mosaicImage } = require('./mosaicUtils');
+const { fileIconType } = require('./fileIcons');
+const { renderComponents, isComponentsV2, messageComponents } = require('./componentUtils');
 const { processReactions } = require('./reactionUtils');
 const { processPoll } = require('./pollUtils');
 const { normalizeWeirdUnicode } = require('./unicodeUtils');
 const {
     unicodeToTwemojiCode,
     cacheCustomEmoji,
-    getSkinToneSelectorHTML,
     processUnicodeEmojiInText,
 } = require('./emojiUtils');
 const emojiRegex = require('./twemojiRegex').regex;
-const notFound = require('./notFound');
 const auth = require('../src/authentication');
 const {
-    isBotReady,
-    parseCookies,
-    resolveTheme,
-    RANDOM_EMOJIS,
-    buildSessionParam,
-    buildEmojiToggleUrl,
-    buildEmojiExpandUrl,
     getTemplate,
     renderTemplate,
     render,
-    generateSEOMetadata,
-    canViewChannel,
+    resolveThemeValue,
+    neutralizePlaceholders,
 } = require('./utils');
 const { parseUserAgent } = require('./userAgentUtils');
 
@@ -69,8 +66,8 @@ const LEGACY_MESSAGE_LIMIT = 25;
 // more than truly memory-starved devices, but their browser engines bog down
 // well before the full cache. All use 50 for consistency.
 const MESSAGE_LIMIT_OVERRIDES = {
-    '3ds': 50,
-    wii: 50,
+    '3ds': 25,
+    wii: 25,
     new3ds: 50,
     ps3: 50,
     psvita: 50,
@@ -111,9 +108,142 @@ const SYSTEM_MESSAGE_TEXT = {
     37: 'disabled raid alert mode',
     38: 'reported a raid',
     39: 'reported a false alarm',
+    40: 'revived a dead chat',
+    41: 'sent a gift',
     44: 'made a purchase',
+    45: 'invited to a voice hangout',
     46: 'completed a poll',
+    47: 'posted a changelog',
+    49: 'linked this channel to a lobby',
+    58: 'deleted the reported message',
+    59: 'timed out the reported user',
+    60: 'kicked the reported user',
+    61: 'banned the reported user',
+    62: 'resolved a report',
+    63: 'added a new emoji',
+    65: 'started a voice hangout',
 };
+
+/**
+ * Returns the italic system-message text for a message, enriching it with
+ * live details where discord.js actually models the underlying data.
+ *
+ * Note: several newer system message fields (gift_info, purchase_notification,
+ * potions) aren't parsed by discord.js yet, so those types fall back to the
+ * static SYSTEM_MESSAGE_TEXT phrasing above rather than going into detail.
+ *
+ * @param {object} item - The Discord message object.
+ * @returns {string} The rendered system message text.
+ */
+function getSystemMessageText(item) {
+    if (item.type === 25 && item.roleSubscriptionData) {
+        const d = item.roleSubscriptionData;
+        const verb = d.isRenewal ? 'renewed' : 'joined';
+        const months = d.totalMonthsSubscribed;
+        return `${verb} ${escape(d.tierName)} and has been a subscriber for ${months} month${months === 1 ? '' : 's'}`;
+    }
+    return SYSTEM_MESSAGE_TEXT[item.type] ?? 'performed an action';
+}
+
+// Inline templates (mention pills) end with the file's newline, which would render
+// as a space before following punctuation; trim it off.
+function renderInline(path, data) {
+    return render(path, data).trim();
+}
+
+// Twemoji shown in the avatar column of a system message row, like Discord's icons.
+const SYSTEM_MESSAGE_ICONS = {
+    6: '1f4cc',
+    7: '27a1',
+    8: '1f48e',
+    9: '1f48e',
+    10: '1f48e',
+    11: '1f48e',
+    12: '27a1',
+    18: '1f9f5',
+    21: '1f9f5',
+    46: '1f4ca',
+};
+
+// System types whose content is a plain value (thread name, boost count, followed
+// channel) folded into the sentence instead of being shown as a message body.
+const SYSTEM_TYPES_WITH_PLAIN_CONTENT = new Set([8, 9, 10, 11, 12, 18, 21]);
+
+const MESSAGE_TYPE_POLL_RESULT = 46;
+
+/**
+ * Text of rendered message HTML with tags stripped (images count as one
+ * character), used to tell whether a message has anything visible.
+ */
+function visibleTextOf(html) {
+    return html
+        .replace(/<img\b[^>]*>/gi, 'x')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Whether a system message renders as its own compact row (icon, author, action,
+ * time) rather than inside an author group. Ones with embeds or attachments,
+ * such as AutoMod alerts and poll results, keep the full message layout.
+ */
+function isStandaloneSystemMessage(item, rawText) {
+    // Poll results are a system line with the result card beneath it.
+    if (item.type === MESSAGE_TYPE_POLL_RESULT) return true;
+    if (item.embeds?.length || item.embeds?.size) return false;
+    if (messageComponents(item).length) return false;
+    if (item.attachments?.size || item.attachments?.length) return false;
+    return SYSTEM_TYPES_WITH_PLAIN_CONTENT.has(item.type) || visibleTextOf(rawText).length === 0;
+}
+
+function getSystemRowText(item) {
+    if (item.type === MESSAGE_TYPE_POLL_RESULT) {
+        const embed = item.embeds?.[0] ?? item.embeds?.first?.();
+        const question = pollResultFields(embed)['poll_question_text'];
+        return question
+            ? `'s poll <b>${escape(normalizeWeirdUnicode(question))}</b> has closed.`
+            : "'s poll has closed.";
+    }
+    const content = escape(normalizeWeirdUnicode(item.content || '')).trim();
+    if ((item.type === 18 || item.type === 21) && content)
+        return `started a thread: <b>${content}</b>`;
+    if (item.type === 12 && content) return `added <b>${content}</b> to this channel`;
+    const boosts = Number(item.content);
+    if (item.type >= 8 && item.type <= 11 && boosts > 1)
+        return `${SYSTEM_MESSAGE_TEXT[item.type]} (${boosts} boosts)`;
+    return getSystemMessageText(item);
+}
+
+function renderSystemMessageRow(
+    item,
+    member,
+    authorText,
+    replyText,
+    clientTimezone,
+    imagesCookie = 1
+) {
+    const icon = SYSTEM_MESSAGE_ICONS[item.type];
+    const text = getSystemRowText(item);
+    const pollEmbed =
+        item.type === MESSAGE_TYPE_POLL_RESULT
+            ? (item.embeds?.[0] ?? item.embeds?.first?.())
+            : null;
+    return render('channel/system-message-row', {
+        ICON: icon
+            ? `<img src="/resources/twemoji/${icon}.gif" class="system-message-icon" width="16" height="16" alt="" />`
+            : '',
+        AUTHOR_NAME: formatAuthorName(getDisplayName(member, item.author)),
+        AUTHOR_COLOR: getMemberColor(member, authorText),
+        COLOR: replyText,
+        // A possessive ("'s poll ...") attaches straight to the name.
+        TEXT: text.startsWith("'") ? text : ' ' + text,
+        DATE: formatDateWithTimezone(item.createdAt, clientTimezone),
+        EXTRA: pollEmbed
+            ? renderPollResultEmbed(pollEmbed, imagesCookie, item.reference?.messageId ?? null)
+            : '',
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -137,13 +267,6 @@ function urlMatchesDomain(url, domain) {
     } catch {
         return false;
     }
-}
-
-function truncateFileName(name) {
-    if (name.length <= 30) return name;
-    const ext = name.replace(/(.*\.)(.*)$/, '$2');
-    const base = name.replace(/(.*\.)(.*)$/, '$1').slice(0, 25);
-    return `${base}...${ext}`;
 }
 
 function truncateText(text, maxLength) {
@@ -247,12 +370,17 @@ function hasNonTextContent(message) {
         message.stickers?.size ||
         message.stickers?.length ||
         message.embeds?.size ||
-        message.embeds?.length
+        message.embeds?.length ||
+        messageComponents(message).length
     );
 }
 
 function isSameAuthor(member1, author1, member2, author2) {
-    if (member1 && member2) return member1.user.id === member2.user.id;
+    if (member1 && member2) {
+        const id1 = member1.user?.id || member1.id;
+        const id2 = member2.user?.id || member2.id;
+        if (id1 && id2) return id1 === id2;
+    }
     if (author1 && author2)
         return author1.id === author2.id && author1.username === author2.username;
     return false;
@@ -367,11 +495,10 @@ const AUDIO_MIME = {
  * @param {object} item - The Discord message object containing attachments.
  * @param {number} imagesCookie - User preference for showing images (1 = enabled).
  * @param {string} tmpl_file_download - The template for file download cards.
- * @param {object} req - The incoming HTTP request (used for UA detection).
  * @returns {string} The HTML with attachments appended to the message text.
  */
 
-function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, req) {
+function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download) {
     let result = messagetext || '';
     const attachments = item?.attachments;
 
@@ -384,10 +511,8 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
     const tmpl_spoiler = getTemplate('spoiler-image', 'channel');
     const tmpl_normal_image = getTemplate('normal-image', 'channel');
     const tmpl_audio_player = getTemplate('audio-player', 'channel');
-    const tmpl_audio_link = getTemplate('audio-link', 'channel');
 
     const IMAGE_EXT = /\.(jpg|gif|png|jpeg|avif|svg|webp|tif|tiff)$/i;
-    const VIDEO_EXT = /\.(mp4|webm|mov|avi|mkv)$/i;
     const AUDIO_EXT = /\.(mp3|ogg|oga|wav|wave|flac|m4a|aac|opus|weba|aiff|aif)$/i;
     const imageData = [];
 
@@ -396,7 +521,6 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
         if (!attachment) continue;
 
         const isImage = IMAGE_EXT.test(attachment.name);
-        const isVideo = VIDEO_EXT.test(attachment.name);
         const isAudio = AUDIO_EXT.test(attachment.name);
         const isSpoiler = attachment.name?.toUpperCase().startsWith('SPOILER_');
 
@@ -426,12 +550,12 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
             // Modern clients get HTML5 <audio> player with controls.
             // Legacy clients will fall back to the <embed> tag inside tmpl_audio_player.
             const card = renderTemplate(tmpl_audio_player, {
-                '{$FILE_NAME}': escape(truncateFileName(attachment.name || 'audio')),
+                '{$FILE_NAME}': escape(attachment.name || 'audio'),
                 '{$FILE_SIZE}': formatFileSize(attachment.size || 0),
                 '{$FILE_LINK}': escape(url),
                 '{$MIME_TYPE}': escape(mimeType),
             });
-            result = (result ? result + getTemplate('br', 'misc') : '') + card;
+            result += card;
         } else {
             // Render a file download card for non-images or if images are disabled.
             const card = renderTemplate(tmpl_file_download, {
@@ -439,12 +563,13 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
                 // into the card's HTML, so an attachment named like
                 // `x"><img src=x onerror=...>` would otherwise execute for every
                 // viewer of the channel (matches the audio branch above).
-                '{$FILE_NAME}': escape(truncateFileName(attachment.name || 'file')),
+                '{$FILE_NAME}': escape(attachment.name || 'file'),
                 '{$FILE_SIZE}': formatFileSize(attachment.size || 0),
+                '{$FILE_ICON}': fileIconType(attachment.name),
                 // Videos are not supported for inline playback yet, so they are just downloads.
-                '{$FILE_LINK}': url,
+                '{$FILE_LINK}': escape(url),
             });
-            result = (result ? result + getTemplate('br', 'misc') : '') + card;
+            result += card;
         }
     }
 
@@ -452,23 +577,17 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
     // Images are rendered in a separate loop so they always appear at the bottom.
     if (imageData.length === 1) {
         const data = imageData[0];
-        result += data.isSpoiler
+        const imageHtml = data.isSpoiler
             ? renderTemplate(tmpl_spoiler, { IMAGE_URL: data.url })
             : renderTemplate(tmpl_normal_image, { IMAGE_URL: data.url });
+        // The templates open with a line break to drop the image below any text;
+        // with no text above it, that break is a blank line under the author name
+        // that Discord doesn't have.
+        result += result.trim() ? imageHtml : imageHtml.replace(/^\s*<br\s*\/?>/i, '');
     } else if (imageData.length > 1) {
-        let galleryContent = '';
-        const tmpl_gallery_item = getTemplate('gallery-item', 'channel');
-        for (const data of imageData) {
-            if (data.isSpoiler) {
-                galleryContent += renderTemplate(tmpl_spoiler, { IMAGE_URL: data.url });
-            } else {
-                galleryContent += renderTemplate(tmpl_gallery_item, { IMAGE_URL: data.url });
-            }
-        }
-        result += render('channel/image-gallery', {
-            COUNT: imageData.length,
-            GALLERY_CONTENT: galleryContent,
-        });
+        result += renderMosaic(
+            imageData.map((data) => mosaicImage(escape(data.url), data.isSpoiler))
+        );
     }
 
     return result;
@@ -486,6 +605,9 @@ function renderAttachments(messagetext, item, imagesCookie, tmpl_file_download, 
  * @returns {string} The HTML with stickers appended.
  */
 
+const STICKER_FORMAT_LOTTIE = 3;
+const STICKER_FORMAT_GIF = 4;
+
 function renderStickers(messagetext, item, imagesCookie) {
     let result = messagetext || '';
     const stickers = item?.stickers;
@@ -500,8 +622,17 @@ function renderStickers(messagetext, item, imagesCookie) {
     for (const sticker of list) {
         if (!sticker) continue;
         const sep = result ? getTemplate('br', 'misc') : '';
-        if (imagesCookie === 1) {
-            result += sep + renderTemplate(tmpl_sticker, { STICKER_ID: sticker.id });
+        // Lottie stickers (format 3) are vector animations with no image on the
+        // CDN to show, so they fall back to their name like images-off mode.
+        const format = sticker.format ?? sticker.format_type;
+        if (imagesCookie === 1 && format !== STICKER_FORMAT_LOTTIE) {
+            result +=
+                sep +
+                renderTemplate(tmpl_sticker, {
+                    STICKER_ID: sticker.id,
+                    EXT: format === STICKER_FORMAT_GIF ? 'gif' : 'png',
+                    STICKER_NAME: escape(sticker.name ?? 'Sticker'),
+                });
         } else {
             result +=
                 sep +
@@ -547,7 +678,7 @@ function buildProxiedImageTag(
  * @returns {string} The updated message HTML.
  */
 function replaceOrAppendMedia(messagetext, embedUrl, imgHtml) {
-    let result = messagetext || '';
+    const result = messagetext || '';
     if (embedUrl) {
         // Look for the URL inside an <a> tag and replace the whole tag with the image.
         const escaped = embedUrl.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -565,11 +696,60 @@ function replaceOrAppendMedia(messagetext, embedUrl, imgHtml) {
 }
 
 /**
+ * True when a message (discord.js or raw API shape) carries the given flag bit.
+ */
+function hasMessageFlag(item, bit) {
+    const flags = item?.flags;
+    if (flags == null) return false;
+    if (typeof flags.has === 'function') return flags.has(bit);
+    const n = typeof flags === 'object' ? Number(flags.bitfield) : Number(flags);
+    return Number.isFinite(n) && (n & bit) !== 0;
+}
+
+const MESSAGE_FLAG_SUPPRESS_EMBEDS = 1 << 2;
+
+/**
+ * URLs the author wrapped in a spoiler (`||https://...||`). Discord hides the
+ * media of those links' embeds behind a spoiler too.
+ */
+function spoileredUrls(content) {
+    const urls = new Set();
+    for (const [, inner] of (content || '').matchAll(/\|\|([\s\S]+?)\|\|/g)) {
+        for (const [url] of inner.matchAll(/https?:\/\/[^\s<>|]+/g)) {
+            urls.add(url.replace(/\/$/, ''));
+        }
+    }
+    return urls;
+}
+
+/**
+ * AutoMod alert embeds carry their details as name/value pairs. Discord shows
+ * the flagged message with the matched keyword and rule beneath it.
+ */
+function autoModerationEmbed(embed) {
+    const fieldMap: Record<string, string> = {};
+    (embed.fields ?? []).forEach((f) => {
+        fieldMap[f.name] = f.value;
+    });
+    const footer = [
+        fieldMap.keyword ? `Keyword: ${fieldMap.keyword}` : null,
+        fieldMap.rule_name ? `Rule: ${fieldMap.rule_name}` : null,
+    ]
+        .filter(Boolean)
+        .join(' • ');
+    return {
+        description: embed.description,
+        footer: footer ? { text: footer } : null,
+    };
+}
+
+/**
  * Processes and renders message embeds (Tenor, Giphy, YouTube, and rich embeds).
  *
- * Special handling is provided for common GIF and video services to inline them
- * as static (proxied) images for compatibility with older browsers.
- * Other rich embeds are delegated to `processEmbeds`.
+ * GIF services and bare image links are inlined as static (proxied) images in
+ * place of the link, as Discord does. Video embeds keep their card with the
+ * thumbnail promoted to a large image behind a play button. Everything else is
+ * delegated to `processEmbeds`.
  *
  * @param {string} messagetext - The current message HTML.
  * @param {object} item - The Discord message object containing embeds.
@@ -583,13 +763,18 @@ function renderEmbeds(messagetext, item, req, imagesCookie, animationsCookie, cl
     let result = messagetext || '';
 
     if (!item?.embeds?.length) return result;
+    if (hasMessageFlag(item, MESSAGE_FLAG_SUPPRESS_EMBEDS)) return result;
 
+    const showImages = imagesCookie === 1;
+    const spoilers = spoileredUrls(item.content);
     const richEmbeds = [];
 
     for (const embed of item.embeds) {
         if (!embed) continue;
 
-        // 1. Detect special media providers
+        const type = embedType(embed);
+        const spoiler = !!embed.url && spoilers.has(embed.url.replace(/\/$/, ''));
+
         const isTenor =
             (embed.provider?.name === 'Tenor' || urlMatchesDomain(embed.url, 'tenor.com')) &&
             embed.thumbnail?.url;
@@ -603,139 +788,87 @@ function renderEmbeds(messagetext, item, req, imagesCookie, animationsCookie, cl
             urlMatchesDomain(embed.url, 'youtube.com') ||
             urlMatchesDomain(embed.url, 'youtu.be');
 
-        const isVimeo =
-            embed.provider?.name === 'Vimeo' || urlMatchesDomain(embed.url, 'vimeo.com');
-
-        const isOtherVideo =
-            ['Streamable', 'Twitch', 'TikTok', 'Instagram', 'Twitter', 'Twitter (X)', 'X'].includes(
-                embed.provider?.name
-            ) ||
-            urlMatchesDomain(embed.url, 'streamable.com') ||
+        // Embedded players (YouTube, Vimeo, Twitch, Streamable) show no
+        // description in Discord; social posts with video keep their text.
+        const isPlayer =
+            isYouTube ||
+            ['Vimeo', 'Twitch', 'Streamable'].includes(embed.provider?.name) ||
+            urlMatchesDomain(embed.url, 'vimeo.com') ||
             urlMatchesDomain(embed.url, 'twitch.tv') ||
-            urlMatchesDomain(embed.url, 'clips.twitch.tv') ||
-            urlMatchesDomain(embed.url, 'tiktok.com') ||
-            urlMatchesDomain(embed.url, 'vxtiktok.com') ||
-            urlMatchesDomain(embed.url, 'instagram.com') ||
-            urlMatchesDomain(embed.url, 'ddinstagram.com') ||
-            urlMatchesDomain(embed.url, 'twitter.com') ||
-            urlMatchesDomain(embed.url, 'x.com') ||
-            urlMatchesDomain(embed.url, 'fxtwitter.com') ||
-            urlMatchesDomain(embed.url, 'vxtwitter.com');
+            urlMatchesDomain(embed.url, 'streamable.com');
 
-        // If images are disabled, we only show text-based rich embeds (including YouTube meta).
-        if (imagesCookie !== 1) {
-            if (!isTenor && !isGiphy) {
-                if (isYouTube) {
-                    // YouTube embeds get a red sidebar for flair.
-                    richEmbeds.push({
-                        color: 0xfd001b,
-                        author: embed.author,
-                        title: embed.title,
-                        url: embed.url,
-                        description: null,
-                        fields: embed.fields,
-                        image: embed.image,
-                        thumbnail: embed.thumbnail,
-                        footer: embed.footer,
-                        timestamp: embed.timestamp,
-                        data: embed.data,
-                        isVideo: true,
-                    });
-                } else if (isVimeo || isOtherVideo) {
-                    richEmbeds.push({
-                        author: embed.author,
-                        title: embed.title,
-                        url: embed.url,
-                        description: null,
-                        fields: embed.fields,
-                        image: embed.image,
-                        thumbnail: embed.thumbnail,
-                        footer: embed.footer,
-                        timestamp: embed.timestamp,
-                        data: embed.data,
-                        isVideo: true,
-                    });
-                } else {
-                    richEmbeds.push(embed);
-                }
-            }
+        const isVideo = type === 'video' || !!(embed.video?.url || embed.video?.proxyURL);
 
-            continue;
-        }
+        // GIFs and bare image links replace the link in the text.
+        const inlineUrl = isTenor
+            ? embed.thumbnail.url
+            : isGiphy
+              ? (embed.image?.url ?? embed.thumbnail?.url)
+              : type === 'image' || type === 'gifv'
+                ? (embed.thumbnail?.url ?? embed.image?.url)
+                : null;
 
-        // 2. Inline rendering for Tenor/Giphy (Static image proxy)
-        if (isTenor) {
+        if (isTenor || isGiphy || type === 'image' || type === 'gifv') {
+            if (!showImages || !inlineUrl) continue;
+            const alt = isTenor ? 'Tenor GIF' : isGiphy ? 'GIPHY GIF' : 'Image';
+            const { proxied, tag } = buildProxiedImageTag(inlineUrl, alt);
             result = replaceOrAppendMedia(
                 result,
                 embed.url,
-                buildProxiedImageTag(embed.thumbnail.url, 'Tenor GIF').tag
+                spoiler
+                    ? render('channel/spoiler-image', { IMAGE_URL: proxied }).replace(
+                          /^\s*<br\s*\/?>/i,
+                          ''
+                      )
+                    : tag
             );
-        } else if (isGiphy) {
-            const rawUrl = embed.image?.url ?? embed.thumbnail?.url;
-
-            if (rawUrl)
-                result = replaceOrAppendMedia(
-                    result,
-                    embed.url,
-                    buildProxiedImageTag(rawUrl, 'GIPHY GIF').tag
-                );
-        } else if (isYouTube) {
-            // YouTube is rendered as a rich embed but with its thumbnail promoted to a large image.
-            richEmbeds.push({
-                color: 0xfd001b,
-                author: embed.author,
-                title: embed.title,
-                url: embed.url,
-                description: null,
-                fields: embed.fields,
-                image: embed.image ?? embed.thumbnail,
-                thumbnail: null,
-                footer: embed.footer,
-                timestamp: embed.timestamp,
-                data: embed.data,
-                isVideo: true,
-            });
-        } else if (isVimeo || isOtherVideo) {
-            // Video platforms are rendered as rich embeds but with thumbnails promoted to large images.
-            richEmbeds.push({
-                author: embed.author,
-                title: embed.title,
-                url: embed.url,
-                description: null,
-                fields: embed.fields,
-                image: embed.image ?? embed.thumbnail,
-                thumbnail: null,
-                footer: embed.footer,
-                timestamp: embed.timestamp,
-                data: embed.data,
-                isVideo: true,
-            });
-        } else if (embed.data?.type === 'poll_result') {
+        } else if (type === 'poll_result') {
             // Discord native poll results are sent as special embeds.
             result =
-                (result ? result + getTemplate('br', 'misc') : '') + renderPollResultEmbed(embed);
-        } else if (embed.data?.type === 'image' || embed.data?.type === 'gifv') {
-            // Raw image/GIFV embeds are inlined directly.
-            const rawUrl = embed.thumbnail?.url ?? embed.image?.url;
-
-            if (rawUrl)
-                result = replaceOrAppendMedia(
-                    result,
-                    embed.url,
-                    buildProxiedImageTag(rawUrl, 'Image').tag
-                );
+                (result ? result + getTemplate('br', 'misc') : '') +
+                renderPollResultEmbed(embed, imagesCookie);
+        } else if (type === 'auto_moderation_message') {
+            richEmbeds.push(autoModerationEmbed(embed));
+        } else if (isVideo) {
+            const plain = plainEmbed(embed);
+            richEmbeds.push({
+                ...plain,
+                color: plain.color ?? (isYouTube ? 0xff0000 : null),
+                description: isPlayer ? null : plain.description,
+                image: plain.image ?? plain.thumbnail,
+                thumbnail: null,
+                isVideo: true,
+                spoiler,
+            });
         } else {
-            // Everything else goes to the general-purpose rich embed processor.
-            richEmbeds.push(embed);
+            richEmbeds.push({ ...plainEmbed(embed), spoiler });
         }
     }
 
     // Process all collected rich embeds at once.
     if (richEmbeds.length > 0) {
-        result += processEmbeds(req, richEmbeds, imagesCookie, animationsCookie, clientTimezone);
+        result += processEmbeds(richEmbeds, imagesCookie, animationsCookie, clientTimezone);
     }
 
     return result;
+}
+
+// Invites and scheduled events linked in messages, cached briefly so a page
+// with an invite doesn't wait on Discord for it on every load. Misses (null)
+// are cached too, so a dead invite isn't retried each time.
+const LINK_LOOKUP_TTL_MS = 5 * 60 * 1000;
+const LINK_LOOKUP_MAX = 500;
+const _inviteCache = new Map();
+const _eventCache = new Map();
+
+async function cachedLookup(cache, key, fetcher) {
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < LINK_LOOKUP_TTL_MS) return hit.value;
+    const value = await fetcher();
+    cache.delete(key);
+    if (cache.size >= LINK_LOOKUP_MAX) cache.delete(cache.keys().next().value);
+    cache.set(key, { value, at: Date.now() });
+    return value;
 }
 
 /**
@@ -771,7 +904,9 @@ async function renderDiscordEvents(messagetext, item, bot, imagesCookie, clientT
             const guild = bot.client.guilds.cache.get(guildId);
             if (!guild) continue;
 
-            const event = await guild.scheduledEvents.fetch(eventId).catch(() => null);
+            const event = await cachedLookup(_eventCache, `${guildId}:${eventId}`, () =>
+                guild.scheduledEvents.fetch(eventId).catch(() => null)
+            );
             if (!event) continue;
 
             const iconUrl = guild.iconURL({ size: 128 });
@@ -851,7 +986,9 @@ async function renderDiscordInvites(messagetext, item, bot, imagesCookie) {
         processedInvites.add(inviteCode);
 
         try {
-            const invite = await bot.client.fetchInvite(inviteCode).catch(() => null);
+            const invite = await cachedLookup(_inviteCache, inviteCode, () =>
+                bot.client.fetchInvite(inviteCode).catch(() => null)
+            );
             if (!invite || !invite.guild) continue;
 
             const iconUrl = invite.guild.iconURL({ size: 128 });
@@ -887,7 +1024,7 @@ async function renderDiscordInvites(messagetext, item, bot, imagesCookie) {
  * @returns {string} The rendered activity banner HTML or an empty string.
  */
 function renderActivityBanner(item, context) {
-    const { templates, req } = context;
+    const { templates, req, imagesCookie } = context;
     // Activity Reply is type 25. Shared activities may also have .activity
     if (item.type !== 25 && !item.activity) return '';
 
@@ -914,13 +1051,14 @@ function renderActivityBanner(item, context) {
     // Icon: Use embed thumbnail, or try application icon
     let iconUrl = embed?.thumbnail?.url || '/resources/twemoji/1f3ae.gif';
     if (!embed?.thumbnail?.url && item.applicationId) {
-        iconUrl = `https://cdn.discordapp.com/app-icons/${item.applicationId}/icon.png`;
+        iconUrl =
+            imagesCookie === 1
+                ? `/imageProxy/app-icon/${item.applicationId}/icon.png`
+                : '/resources/twemoji/1f3ae.gif';
     }
 
-    // Theme-aware colors
-    const cookies = parseCookies(req);
-    const themeValue = parseInt(cookies.whiteThemeCookie, 10) || 0;
-    const isLight = themeValue === 1;
+    // Theme-aware colors (URL ?theme= wins, for cookieless consoles)
+    const isLight = resolveThemeValue(req) === 1;
 
     return renderTemplate(templates.activityBanner, {
         AUTHOR_NAME: formatAuthorName(authorName),
@@ -936,52 +1074,202 @@ function renderActivityBanner(item, context) {
 }
 
 /**
- * Renders a poll result summary from a Discord poll embed.
- *
- * @param {object} embed - The poll result embed object.
- * @returns {string} The rendered poll result HTML.
+ * Fields of a poll result embed (Discord sends them as name/value pairs).
  */
-function renderPollResultEmbed(embed) {
-    const fieldMap = {};
-    (embed.fields ?? []).forEach((f) => {
+function pollResultFields(embed): Record<string, string> {
+    const fieldMap: Record<string, string> = {};
+    (embed?.fields ?? []).forEach((f) => {
         fieldMap[f.name] = f.value;
     });
-    const question = fieldMap['poll_question_text'] ?? '';
+    return fieldMap;
+}
+
+/**
+ * Renders the card Discord shows under a "poll has closed" message: the
+ * winning answer with a check and its share of the vote, or a note that the
+ * poll tied or got no votes, plus a button that jumps to the poll.
+ *
+ * @param {object} embed - The poll result embed object.
+ * @param {number} imagesCookie - User preference for images (1 = enabled).
+ * @param {string|null} pollMessageId - ID of the poll message, for "View Poll".
+ * @returns {string} The rendered poll result HTML.
+ */
+function renderPollResultEmbed(embed, imagesCookie = 1, pollMessageId = null) {
+    const fieldMap = pollResultFields(embed);
     const winnerText = fieldMap['victor_answer_text'] ?? '';
-    const winnerEmoji = fieldMap['victor_answer_emoji_name'] ?? '';
-    const winnerVotes = fieldMap['victor_answer_votes'] ?? '0';
-    const totalVotes = fieldMap['total_votes'] ?? '0';
-    const emojiPart = winnerEmoji ? escape(winnerEmoji) + ' ' : '';
+    const winnerVotes = Number(fieldMap['victor_answer_votes'] ?? 0);
+    const totalVotes = Number(fieldMap['total_votes'] ?? 0);
+
+    let winner;
+    let detail = '';
+    if (totalVotes === 0) {
+        winner = 'There were no votes';
+    } else if (!winnerText) {
+        winner = 'The results were tied';
+    } else {
+        const emojiId = fieldMap['victor_answer_emoji_id'];
+        const emojiName = fieldMap['victor_answer_emoji_name'];
+        let emoji = '';
+        if (emojiId && imagesCookie === 1) {
+            const animated = fieldMap['victor_answer_emoji_animated'] === 'true';
+            emoji = render('channel/emoji-custom', {
+                EMOJI_ID: escape(emojiId),
+                EXT: animated ? 'gif' : 'png',
+                PX: '20',
+                STYLE: 'width: 1.25em; height: 1.25em; vertical-align: -0.25em; margin-right: 4px;',
+            });
+        } else if (emojiName) {
+            emoji =
+                (imagesCookie === 1
+                    ? processUnicodeEmojiInText(escape(emojiName), 20, '1.25em')
+                    : escape(emojiName)) + ' ';
+        }
+        winner = emoji + escape(winnerText) + getTemplate('poll-result-check', 'channel').trim();
+        const percent = Math.round((winnerVotes / totalVotes) * 100);
+        detail = render('channel/poll-result-detail', {
+            TEXT: `Winning answer \u00b7 ${percent}%`,
+        });
+    }
 
     return render('channel/poll-result', {
-        QUESTION: escape(question),
-        WINNER_EMOJI: emojiPart,
-        WINNER_TEXT: escape(winnerText),
-        WINNER_VOTES: escape(winnerVotes),
-        TOTAL_VOTES: escape(totalVotes),
+        WINNER: winner,
+        DETAIL: detail,
+        VIEW_POLL: pollMessageId
+            ? render('channel/poll-result-view', { HREF: `#msg-${escape(pollMessageId)}` })
+            : '',
     });
 }
 
 // ---------------------------------------------------------------------------
-// Mentions
+// Game mentions
 // ---------------------------------------------------------------------------
+// Discord's `<@$id>` game-mention syntax (added Aug 2026) embeds a game's
+// Discord profile inline. There's no bot-scoped endpoint for arbitrary
+// third-party applications, so we use the same unauthenticated RPC endpoint
+// Rich Presence clients use to resolve name/icon. Metadata rarely changes,
+// so results (including failures, to avoid hammering a dead/unknown ID) are
+// cached for the life of the process, bounded like the other in-memory caches.
+
+const MAX_GAME_APP_CACHE_SIZE = 500;
+const _gameAppCache = new Map();
+const GAME_APP_FETCH_TIMEOUT_MS = 4000;
+const GAME_MENTION_FALLBACK_ICON = '/resources/twemoji/1f3ae.gif';
+
+/**
+ * Fetches (and caches) an application's public name/icon via Discord's
+ * unauthenticated RPC endpoint, used to resolve `<@$id>` game mentions.
+ *
+ * @param {string} id - The application's snowflake ID.
+ * @returns {Promise<{id: string, name: string, icon: ?string}|null>} App info, or null if unresolvable.
+ */
+async function fetchGameApplication(id) {
+    if (_gameAppCache.has(id)) return _gameAppCache.get(id);
+
+    let result = null;
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), GAME_APP_FETCH_TIMEOUT_MS);
+        try {
+            const res = await fetch(`https://discord.com/api/v10/applications/${id}/rpc`, {
+                signal: controller.signal,
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data && data.name) {
+                    result = { id, name: data.name, icon: data.icon || null };
+                }
+            }
+        } finally {
+            clearTimeout(timeout);
+        }
+    } catch {
+        // Network failure, timeout, or bad JSON: cache the miss below so we
+        // don't retry a dead/invalid ID on every message that references it.
+    }
+
+    if (_gameAppCache.size >= MAX_GAME_APP_CACHE_SIZE) {
+        _gameAppCache.delete(_gameAppCache.keys().next().value);
+    }
+    _gameAppCache.set(id, result);
+    return result;
+}
+
+/**
+ * Renders a resolved game mention as an inline card (icon + name) linking to
+ * the game's Discord application-directory profile.
+ *
+ * @param {{id: string, name: string, icon: ?string}} app - Resolved application info.
+ * @param {boolean} isLight - Whether the light theme is active.
+ * @returns {string} The rendered HTML card.
+ */
+function renderGameMentionCard(app, isLight, imagesCookie) {
+    const iconUrl =
+        app.icon && imagesCookie === 1
+            ? `/imageProxy/app-icon/${app.id}/${app.icon}.png`
+            : GAME_MENTION_FALLBACK_ICON;
+    return renderInline('channel/game-mention', {
+        APP_ID: app.id,
+        ICON_URL: escape(iconUrl),
+        GAME_NAME: escape(normalizeWeirdUnicode(app.name)),
+        BORDER_COLOR: isLight ? '#e3e5e8' : '#40444b',
+        BG_COLOR: isLight ? 'rgba(79, 84, 92, 0.08)' : 'rgba(79, 84, 92, 0.16)',
+        TEXT_COLOR: isLight ? '#060607' : '#dcddde',
+    });
+}
+
+/**
+ * Resolves and renders `<@$id>` game mentions.
+ *
+ * @param {string} messagetext - The text to process.
+ * @param {object} req - The current request (used to resolve theme).
+ * @param {string} tmpl_mention - The template for the plain-pill fallback.
+ * @param {boolean} [compact=false] - Render a plain text pill instead of the
+ *   full icon+name card; used for reply previews, which are single-line and
+ *   length-capped, so a multi-cell table risks corrupting the truncation.
+ * @param {number} [imagesCookie] - User preference for images; game icons are
+ *   proxied through /imageProxy when enabled, and fall back to a local asset
+ *   (never hotlinked) when disabled.
+ * @returns {Promise<string>} The text with game mentions resolved.
+ */
+async function resolveGameMentions(messagetext, req, tmpl_mention, compact = false, imagesCookie) {
+    const ids = [...new Set([...messagetext.matchAll(/&lt;@\$(\d{16,20})&gt;/g)].map((m) => m[1]))];
+    if (ids.length === 0) return messagetext;
+
+    const apps = new Map();
+    await Promise.allSettled(
+        ids.map(async (id) => {
+            apps.set(id, await fetchGameApplication(id));
+        })
+    );
+
+    const isLight = resolveThemeValue(req) === 1;
+
+    return messagetext.replace(/&lt;@\$(\d{16,20})&gt;/g, (match, id) => {
+        const app = apps.get(id);
+        if (!app) return renderTemplate(tmpl_mention, { '{$USERNAME}': '@Unknown Game' });
+        if (compact)
+            return renderTemplate(tmpl_mention, {
+                '{$USERNAME}': '@' + normalizeWeirdUnicode(app.name),
+            });
+        return renderGameMentionCard(app, isLight, imagesCookie);
+    });
+}
 
 /**
  * Renders a role mention pill with appropriate coloring.
  *
  * @param {object} role - The Discord role object.
- * @param {string} tmpl_mention - The base mention template.
  * @returns {string} The HTML for the role mention pill.
  */
 
-function roleMentionPill(role, tmpl_mention) {
+function roleMentionPill(role) {
     const name = escape('@' + normalizeWeirdUnicode(role.name));
     if (role.color !== 0) {
         const hex = role.hexColor;
         const r = parseInt(hex.slice(1, 3), 16),
             g = parseInt(hex.slice(3, 5), 16),
             b = parseInt(hex.slice(5, 7), 16);
-        return render('channel/role-mention-colored', {
+        return renderInline('channel/role-mention-colored', {
             HEX: hex,
             R: r.toString(),
             G: g.toString(),
@@ -989,7 +1277,7 @@ function roleMentionPill(role, tmpl_mention) {
             NAME: name,
         });
     }
-    return render('channel/role-mention-plain', { NAME: name });
+    return renderInline('channel/role-mention-plain', { NAME: name });
 }
 
 /**
@@ -1029,11 +1317,7 @@ function renderKnownMentions(messagetext, item, discordID, member, templates) {
         if (Array.isArray(roles)) {
             for (const role of roles) {
                 if (!role) continue;
-                const tmpl =
-                    member && member.roles.cache?.has(role.id)
-                        ? templates.mentionHighlighted
-                        : templates.mention;
-                result = result.split(`&lt;@&amp;${role.id}&gt;`).join(roleMentionPill(role, tmpl));
+                result = result.split(`&lt;@&amp;${role.id}&gt;`).join(roleMentionPill(role));
             }
         }
     }
@@ -1081,11 +1365,10 @@ async function resolveRemainingMentions(messagetext, chnl, memberCache, tmpl_men
  *
  * @param {string} messagetext - The text to process.
  * @param {object} bot - The bot instance.
- * @param {object} chnl - The current Discord channel object.
  * @returns {Promise<string>} The text with channel mentions resolved.
  */
 
-async function resolveChannelMentions(messagetext, bot, chnl) {
+async function resolveChannelMentions(messagetext, bot) {
     const unresolvedIds = [...messagetext.matchAll(/&lt;#(\d{16,20})&gt;/g)]
         .map((m) => m[1])
         .filter((id) => !bot.client.channels.cache.has(id));
@@ -1097,12 +1380,12 @@ async function resolveChannelMentions(messagetext, bot, chnl) {
         })
     );
     return messagetext.replace(/&lt;#(\d{16,20})&gt;/g, (match, id) => {
-        const { ChannelType } = require('discord');
+        const { ChannelType } = require('discord.js');
         const ch = bot.client.channels.cache.get(id);
         if (!ch) return match;
         if (ch.type === ChannelType.GuildForum || ch.type === ChannelType.GuildMedia)
             return '#' + escape(normalizeWeirdUnicode(ch.name));
-        return render('channel/channel-mention', {
+        return renderInline('channel/channel-mention', {
             CHANNEL_URL: `/channels/${ch.id}`,
             CHANNEL_NAME: escape(normalizeWeirdUnicode(ch.name)),
         });
@@ -1191,7 +1474,7 @@ async function resolveForwardData(
     barColor
 ) {
     try {
-        const fwdMsg = await item.fetchReference();
+        const fwdMsg = await fetchReferencedMessage(item, bot);
 
         const fwdMember = fwdMsg.author?.bot
             ? null
@@ -1352,7 +1635,69 @@ async function resolveRawMentionsForPreview(text, msg, memberCache, chnl, bot) {
         return ch ? '#' + normalizeWeirdUnicode(ch.name) : match;
     });
 
+    const gameIds = [...new Set([...text.matchAll(/<@\$(\d{16,20})>/g)].map((m) => m[1]))];
+    const games = new Map();
+    await Promise.allSettled(
+        gameIds.map(async (id) => games.set(id, await fetchGameApplication(id)))
+    );
+    text = text.replace(/<@\$(\d{16,20})>/g, (match, id) => {
+        const app = games.get(id);
+        return app ? '@' + normalizeWeirdUnicode(app.name) : '@Unknown Game';
+    });
+
     return text;
+}
+
+/**
+ * Fetches the message a reply or forward points at, through the bot's message
+ * cache when it has one so repeat page loads don't refetch it from Discord.
+ *
+ * @param {object} item - The Discord message holding the reference.
+ * @param {object} bot - The bot instance.
+ * @returns {Promise<object>} The referenced message.
+ */
+function fetchReferencedMessage(item, bot) {
+    const { channelId, messageId } = item.reference || {};
+    if (!messageId || typeof bot?.getMessageCached !== 'function') {
+        return item.fetchReference();
+    }
+    return bot.getMessageCached(channelId, messageId);
+}
+
+/**
+ * Warms the caches the render loop reads from, all at once instead of one
+ * Discord round-trip per message: reply and forward targets, then the members
+ * behind every message and target. The loop then finds them already cached.
+ *
+ * @param {Array} messages - Messages about to be rendered.
+ * @param {object} chnl - The Discord channel object.
+ * @param {object} bot - The bot instance.
+ * @param {Map} memberCache - This render pass's member cache.
+ */
+async function prefetchMessageData(messages, chnl, bot, memberCache) {
+    if (!chnl?.guild) return;
+
+    const referenced = await Promise.all(
+        messages
+            .filter((msg) => msg.reference?.messageId)
+            .map((msg) => fetchReferencedMessage(msg, bot).catch(() => null))
+    );
+
+    // One lookup per author, keyed the way ensureMemberData keys its cache.
+    // Bot-authored reply/forward targets are rendered without a member.
+    const byAuthor = new Map();
+    const targets = referenced.filter((msg) => msg?.author && !msg.author.bot);
+    for (const msg of [...messages, ...targets]) {
+        if (!msg?.author) continue;
+        const isAppWebhook =
+            msg.webhookId && msg.applicationId && msg.webhookId === msg.applicationId;
+        const key =
+            msg.webhookId && !isAppWebhook ? `webhook:${msg.author.username}` : msg.author.id;
+        if (!byAuthor.has(key)) byAuthor.set(key, msg);
+    }
+    await Promise.allSettled(
+        [...byAuthor.values()].map((msg) => ensureMemberData(msg, chnl.guild, memberCache))
+    );
 }
 
 /**
@@ -1363,25 +1708,15 @@ async function resolveRawMentionsForPreview(text, msg, memberCache, chnl, bot) {
  * @param {Map} memberCache - Cache of fetched members.
  * @param {object} bot - The bot instance.
  * @param {number} imagesCookie - User preference for images.
- * @param {number} animationsCookie - User preference for animations.
- * @param {string} barColor - CSS color for the side bar.
  * @param {string} authorText - CSS color for author names.
  * @returns {Promise<object|null>} Resolved reply data or null.
  */
 
-async function resolveReplyData(
-    item,
-    chnl,
-    memberCache,
-    bot,
-    imagesCookie,
-    animationsCookie,
-    barColor,
-    authorText,
-    context
-) {
+async function resolveReplyData(item, chnl, memberCache, bot, imagesCookie, authorText, context) {
     try {
-        const replyMessage = await item.fetchReference().catch(() => null);
+        const replyMessage =
+            (item.reference?.messageId && chnl.messages?.cache?.get(item.reference.messageId)) ||
+            (await fetchReferencedMessage(item, bot).catch(() => null));
 
         const replyUser = replyMessage?.author ?? item.mentions?.repliedUser;
 
@@ -1394,6 +1729,12 @@ async function resolveReplyData(
             if (!replyUser?.id) return undefined;
 
             if (memberCache.has(replyUser.id)) return memberCache.get(replyUser.id);
+
+            const cachedReplyMember = chnl.guild?.members?.cache?.get(replyUser.id);
+            if (cachedReplyMember) {
+                memberCache.set(replyUser.id, cachedReplyMember);
+                return cachedReplyMember;
+            }
 
             return chnl.guild.members
                 .fetch(replyUser.id)
@@ -1412,7 +1753,7 @@ async function resolveReplyData(
                   // rest of the markup (links, custom emoji, spoilers) first, then
                   // HTML-escape so the mention tokens become the &lt;@id&gt; form
                   // the pipeline expects.
-                  const { discordID, member, templates } = context ?? {};
+                  const { discordID, member, templates, req } = context ?? {};
                   const flat = flattenPreviewMarkup(
                       replyMessage.content.replace(/\r?\n/g, ' ').replace(/  +/g, ' ').trim()
                   );
@@ -1433,7 +1774,14 @@ async function resolveReplyData(
                   let html = he.encode(flat.trim(), { useNamedReferences: true });
                   html = renderKnownMentions(html, replyMessage, discordID, member, templates);
                   html = await resolveRemainingMentions(html, chnl, memberCache, templates.mention);
-                  html = await resolveChannelMentions(html, bot, chnl);
+                  html = await resolveChannelMentions(html, bot);
+                  html = await resolveGameMentions(
+                      html,
+                      req,
+                      templates.mention,
+                      true,
+                      imagesCookie
+                  );
                   html = renderEveryoneMentions(html, replyMessage, templates);
                   // Channel mentions wrap their pill in a link to the channel.
                   // The preview as a whole is already an <a> that jumps to the
@@ -1449,6 +1797,7 @@ async function resolveReplyData(
             author: getDisplayName(replyMember, replyUser),
             authorId: replyUser?.id,
             authorColor: getMemberColor(replyMember, authorText),
+            avatarUrl: replyUser ? getDisplayAvatarURL(replyMember, replyUser) : null,
             mentionsPing:
                 item.mentions?.repliedUser !== null &&
                 item.mentions?.repliedUser !== undefined &&
@@ -1462,6 +1811,9 @@ async function resolveReplyData(
             // Discord. Falls back to the reference's messageId when the message
             // itself couldn't be fetched (e.g. deleted).
             messageId: replyMessage?.id ?? item.reference?.messageId ?? null,
+            // Neither the message nor its author could be found: Discord shows
+            // "Original message was deleted" rather than a name.
+            deleted: !replyMessage && !replyUser,
         };
     } catch (err) {
         console.error('Could not process reply data:', err);
@@ -1469,13 +1821,33 @@ async function resolveReplyData(
     }
 }
 
-function buildReplyIndicator(
-    replyData,
-    replyText,
-    barColor = '#808080',
-    imagesCookie = 0,
-    channelId = ''
-) {
+/**
+ * Discord shows the quoted author's (or command user's) avatar at 16px between
+ * the reply connector and their name.
+ */
+function renderMiniAvatar(avatarUrl, imagesCookie) {
+    if (!avatarUrl || imagesCookie !== 1) return '';
+    return render('channel/reply-avatar', {
+        AVATAR_URL: escape(`/imageProxy/external/${Buffer.from(avatarUrl).toString('base64')}`),
+    });
+}
+
+function buildReplyIndicator(replyData, replyText, barColor = '#808080', imagesCookie = 0) {
+    if (replyData.deleted)
+        return render('channel/reply-container', {
+            CONTENT: render('channel/reply-with-content', {
+                BAR_COLOR: barColor,
+                AUTHOR_COLOR: replyText,
+                MINI_AVATAR: '',
+                AT_SIGN: '',
+                AUTHOR_NAME: '',
+                CONTENT_TD: render('channel/reply-content-cell', {
+                    REPLY_TEXT: replyText,
+                    REPLY_PREVIEW: '<i>Original message was deleted</i>',
+                }),
+            }),
+        });
+
     // `content` arrives as ready HTML (mention pills already rendered by the same
     // pipeline a normal message uses), so only collapse whitespace *between*
     // tags — never touch the tags themselves, and never re-encode it.
@@ -1525,6 +1897,7 @@ function buildReplyIndicator(
     const replyContent = render('channel/reply-with-content', {
         BAR_COLOR: barColor,
         AUTHOR_COLOR: replyData.authorColor,
+        MINI_AVATAR: renderMiniAvatar(replyData.avatarUrl, imagesCookie),
         AT_SIGN: replyData.mentionsPing ? '@' : '',
         AUTHOR_NAME: formatAuthorName(replyData.author),
         CONTENT_TD: contentTd,
@@ -1563,6 +1936,7 @@ async function resolveInteractionData(item, chnl, memberCache, authorText) {
         return {
             author: getDisplayName(member, user),
             authorColor: getMemberColor(member, authorText),
+            avatarUrl: getDisplayAvatarURL(member, user),
             commandName: item.interaction.commandName,
         };
     } catch (err) {
@@ -1571,9 +1945,15 @@ async function resolveInteractionData(item, chnl, memberCache, authorText) {
     }
 }
 
-function buildInteractionIndicator(interactionData, textColor, barColor = '#808080') {
+function buildInteractionIndicator(
+    interactionData,
+    textColor,
+    barColor = '#808080',
+    imagesCookie = 0
+) {
     const content = render('channel/interaction-indicator', {
         BAR_COLOR: barColor,
+        MINI_AVATAR: renderMiniAvatar(interactionData.avatarUrl, imagesCookie),
         AUTHOR_COLOR: interactionData.authorColor,
         AUTHOR_NAME: formatAuthorName(interactionData.author),
         TEXT_COLOR: textColor,
@@ -1601,6 +1981,7 @@ function buildAuthorPills(state) {
     const isVerifiedBot = state.lastIsVerified;
     const isSlashCommand = state.lastIsInteraction;
     const isWebhook = state.lastIsWebhook;
+    const isBot = state.lastIsBot;
     const isDiscross = state.lastIsDiscross;
 
     if (isDiscross) {
@@ -1615,7 +1996,8 @@ function buildAuthorPills(state) {
     } else {
         if (isVerifiedBot || isSlashCommand) {
             pills += getTemplate('verified-app-pill', 'channel');
-        } else if (isWebhook) {
+        } else if (isWebhook || isBot) {
+            // Discord tags every bot account "APP", not only verified ones.
             pills += getTemplate('app-pill', 'channel');
         }
     }
@@ -1648,10 +2030,15 @@ function flushMessageGroup(state, templates, authorText, replyText, barColor, ch
     const baseHtml = (() => {
         // A continuation block is a group that starts mid-way through a multi-message block
         // (e.g. if the first message in the fetch was actually a merged message).
-        if (state.isContinuationBlock && !state.isForwarded && !state.lastMentioned)
-            return renderTemplate(templates.messageContinuation, {
-                '{$MESSAGE_CONTENT}': state.currentmessage,
-            });
+        // Groups are also split where a ping starts or ends (see renderMessages), so only
+        // the pinging messages are highlighted, as in Discord.
+        if (state.isContinuationBlock && !state.isForwarded)
+            return renderTemplate(
+                state.lastMentioned
+                    ? templates.messageContinuationMentioned
+                    : templates.messageContinuation,
+                { '{$MESSAGE_CONTENT}': state.currentmessage }
+            );
 
         // Mentioned messages get a yellow-ish background/highlight.
         if (state.isForwarded && state.lastMentioned)
@@ -1702,22 +2089,41 @@ function flushMessageGroup(state, templates, authorText, replyText, barColor, ch
     const authorColor = getMemberColor(state.lastmember, authorText);
 
     // If the group starts with a reply or was an interaction, build the top "indicator" bar.
-    const replyIndicator = state.lastReply
-        ? buildReplyIndicator(
-              state.lastReplyData,
-              replyText,
-              barColor,
-              state.imagesCookie,
-              channelId
-          )
+    // It's rendered as its own full-width table row (rather than stacked inside the
+    // avatar's rowspan) so the avatar still lines up with the username row beneath it
+    // instead of being pulled up to the top of the indicator.
+    const indicatorContent = state.lastReply
+        ? buildReplyIndicator(state.lastReplyData, replyText, barColor, state.imagesCookie)
         : state.lastInteraction
-          ? buildInteractionIndicator(state.lastInteractionData, replyText, barColor)
+          ? buildInteractionIndicator(
+                state.lastInteractionData,
+                replyText,
+                barColor,
+                state.imagesCookie
+            )
           : '';
+
+    const replyIndicator = indicatorContent
+        ? render('channel/indicator-row', { CONTENT: indicatorContent })
+        : '';
+
+    const rawAvatarUrl = getDisplayAvatarURL(state.lastmember, state.lastauthor);
+    const proxiedAvatarUrl =
+        rawAvatarUrl && state.imagesCookie === 1
+            ? `/imageProxy/external/${Buffer.from(rawAvatarUrl).toString('base64')}`
+            : '';
+
+    const authorAvatar = proxiedAvatarUrl
+        ? render('channel/author-avatar', {
+              AVATAR_URL: escape(proxiedAvatarUrl),
+          })
+        : '';
 
     return renderTemplate(afterForwarded, {
         '{$MESSAGE_AUTHOR}':
             formatAuthorName(getDisplayName(state.lastmember, state.lastauthor)) +
             buildAuthorPills(state),
+        '{$AUTHOR_AVATAR}': authorAvatar,
         '{$AUTHOR_COLOR}': authorColor,
         '{$REPLY_INDICATOR}': replyIndicator,
         '{$PING_INDICATOR}': '', // Placeholder for future ping visual effects
@@ -1765,13 +2171,11 @@ async function renderMessageContent(item, context) {
 
     const withEmojis = renderEmojis(withDiscordTimestamps, item, imagesCookie, animationsCookie);
 
-    const withAttachments = renderAttachments(
-        withEmojis,
-        item,
-        imagesCookie,
-        templates.fileDownload,
-        req
-    );
+    // Components V2 messages place their attachments through media gallery and
+    // file components, so Discord doesn't list them again underneath.
+    const withAttachments = isComponentsV2(item)
+        ? withEmojis
+        : renderAttachments(withEmojis, item, imagesCookie, templates.fileDownload);
 
     const withStickers = renderStickers(withAttachments, item, imagesCookie);
 
@@ -1796,8 +2200,23 @@ async function renderMessageContent(item, context) {
 
     const withPoll = item?.poll ? withInvites + processPoll(item.poll, imagesCookie) : withInvites;
 
+    const withComponents =
+        withPoll +
+        renderComponents(item, {
+            imagesCookie,
+            animationsCookie,
+            clientTimezone,
+            renderFileCard: (name, size, url) =>
+                renderTemplate(templates.fileDownload, {
+                    '{$FILE_NAME}': escape(name),
+                    '{$FILE_SIZE}': formatFileSize(size),
+                    '{$FILE_ICON}': fileIconType(name),
+                    '{$FILE_LINK}': escape(url),
+                }),
+        });
+
     const activityBanner = renderActivityBanner(item, context);
-    const withActivity = withPoll + activityBanner;
+    const withActivity = withComponents + activityBanner;
 
     const withKnownMentions = renderKnownMentions(withActivity, item, discordID, member, templates);
 
@@ -1808,9 +2227,17 @@ async function renderMessageContent(item, context) {
         templates.mention
     );
 
-    const withChannelMentions = await resolveChannelMentions(withRemainingMentions, bot, chnl);
+    const withChannelMentions = await resolveChannelMentions(withRemainingMentions, bot);
 
-    const withEveryoneMentions = renderEveryoneMentions(withChannelMentions, item, templates);
+    const withGameMentions = await resolveGameMentions(
+        withChannelMentions,
+        req,
+        templates.mention,
+        false,
+        imagesCookie
+    );
+
+    const withEveryoneMentions = renderEveryoneMentions(withGameMentions, item, templates);
 
     let withRoleMentions = withEveryoneMentions;
 
@@ -1822,11 +2249,9 @@ async function renderMessageContent(item, context) {
         if (Array.isArray(roles)) {
             for (const role of roles) {
                 if (!role) continue;
-                const hasRole = member && member.roles.cache?.has(role.id);
-                const tmpl = hasRole ? templates.mentionHighlighted : templates.mention;
                 withRoleMentions = withRoleMentions
                     .split(`&lt;@&amp;${role.id}&gt;`)
-                    .join(roleMentionPill(role, tmpl));
+                    .join(roleMentionPill(role));
             }
         }
     }
@@ -1884,45 +2309,90 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
         channelId,
         messages: overrideMessages,
         templates: overrideTemplates,
+        before,
+        around,
+        sessionParam = '',
     } = params;
 
     // 1. Initialize templates. We use subfolders for organized template retrieval.
-    const templates = overrideTemplates ?? {
+    // Callers may override some templates; anything they leave out falls back
+    // to the default so a partial override can't render "undefined".
+    const templates = {
         message: getTemplate('message', 'message'),
         messageForwarded: getTemplate('forwarded-message', 'message'),
         messageMentioned: getTemplate('message-mentioned', 'message'),
         messageForwardedMentioned: getTemplate('forwarded-message-mentioned', 'message'),
         firstMessageContent: getTemplate('first-message-content', 'message'),
         mergedMessageContent: getTemplate('merged-message-content', 'message'),
-        mention: getTemplate('mention', 'message'),
-        mentionHighlighted: getTemplate('mention', 'message'),
+        editedMarker: getTemplate('edited-marker', 'message'),
+        // Inline templates: drop the file's trailing newline, which would render as
+        // a space before following punctuation ("@name ,").
+        mention: getTemplate('mention', 'message').trim(),
+        mentionHighlighted: getTemplate('mention', 'message').trim(),
         fileDownload: getTemplate('file-download', 'channel'),
         reactions: getTemplate('reactions', 'message'),
         reaction: getTemplate('reaction', 'message'),
         dateSeparator: getTemplate('date-separator', 'message'),
         messageContinuation: getTemplate('message-continuation', 'message'),
+        messageContinuationMentioned: getTemplate('message-continuation-mentioned', 'message'),
         activityBanner: getTemplate('activity-banner', 'channel'),
+        ...overrideTemplates,
     };
 
     // For legacy/low-memory devices, we limit the number of messages rendered.
-    const uaClient = parseUserAgent(req.headers['user-agent']);
+    const uaClient = parseUserAgent(req?.headers?.['user-agent']);
     const messageLimit = uaClient
         ? (MESSAGE_LIMIT_OVERRIDES[uaClient.id] ??
           (uaClient.isLegacy ? LEGACY_MESSAGE_LIMIT : null))
         : null;
 
-    // 2. Fetch messages (or use override). On a cold cache, only fetch as many
-    // messages as this client is actually going to render, so the response
-    // isn't held up fetching messages that will just get sliced off below;
-    // the rest of the shared cache backfills in the background.
-    let messages = overrideMessages ?? (await bot.getHistoryCached(chnl, messageLimit));
+    const pageSize = messageLimit ?? 25;
 
-    if (messageLimit !== null) {
-        messages = messages.slice(-messageLimit);
+    // 2. Fetch messages (or use override).
+    const allFetched =
+        overrideMessages ?? (await bot.getHistoryCached(chnl, pageSize, before, around));
+
+    let messages = allFetched;
+    let hasMore = false;
+    if (allFetched.length > pageSize) {
+        hasMore = true;
+        messages = allFetched.slice(-pageSize);
+    } else if (messageLimit !== null) {
+        messages = allFetched.slice(-messageLimit);
+    }
+
+    let paginationHtml = '';
+    if (hasMore && messages.length > 0 && channelId) {
+        const oldestId = messages[0].id;
+        const cleanSession = sessionParam
+            ? sessionParam.startsWith('?')
+                ? sessionParam.slice(1)
+                : sessionParam
+            : '';
+        const queryParams = new URLSearchParams(cleanSession);
+        queryParams.set('before', oldestId);
+        const loadMoreUrl = `/channels/${channelId}?${queryParams.toString()}`;
+        const jumpToPresentUrl = `/channels/${channelId}${cleanSession ? '?' + cleanSession : ''}#end`;
+
+        paginationHtml = `<div class="pagination-container" style="text-align: center; margin: 4px 0 12px 0;"><a href="${loadMoreUrl}" class="discross-button pagination-btn" style="display: inline-block; padding: 6px 16px; text-decoration: none; font-size: 14px; font-weight: 500;">Load More Messages</a>${before ? ` <a href="${jumpToPresentUrl}" class="discross-button secondary pagination-btn" style="display: inline-block; padding: 6px 16px; margin-left: 8px; text-decoration: none; font-size: 14px; font-weight: 500;">Jump to Present</a>` : ''}</div>`;
+    } else if (around && messages.length > 0 && channelId) {
+        // Landed here from a search result jump: there's no older-messages
+        // link (the around fetch is centered, not a page boundary), but the
+        // user still needs a way back to the live view.
+        const cleanSession = sessionParam
+            ? sessionParam.startsWith('?')
+                ? sessionParam.slice(1)
+                : sessionParam
+            : '';
+        const jumpToPresentUrl = `/channels/${channelId}${cleanSession ? '?' + cleanSession : ''}#end`;
+
+        paginationHtml = `<div class="pagination-container" style="text-align: center; margin: 4px 0 12px 0;"><a href="${jumpToPresentUrl}" class="discross-button pagination-btn" style="display: inline-block; padding: 6px 16px; text-decoration: none; font-size: 14px; font-weight: 500;">Jump to Present</a></div>`;
     }
 
     // memberCache is used to avoid redundant Discord API calls for avatars/names within this render pass.
     const memberCache = new Map();
+
+    await prefetchMessageData(messages, chnl, bot, memberCache);
 
     const context = {
         bot,
@@ -1964,6 +2434,7 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
         lastIsWebhook: false, // Message was sent via webhook
         lastIsInteraction: false, // Message has interaction metadata
         lastIsDiscross: false, // Message was specifically sent via Discross
+        lastUserAgent: null, // User-Agent string of the previous message's sender
         clientTimezone,
     };
 
@@ -2005,7 +2476,7 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
         const shouldStartNewGroup = (item) =>
             !state.lastauthor ||
             !isSameAuthor(state.lastmember, state.lastauthor, null, item.author) ||
-            item.createdAt - state.lastdate > MESSAGE_GROUP_TIMEOUT_MS ||
+            item.createdAt.getTime() - state.lastdate.getTime() > MESSAGE_GROUP_TIMEOUT_MS ||
             !!item.reference ||
             state.lastInteraction ||
             state.lastForwarded ||
@@ -2036,16 +2507,26 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
         const currentMember = await ensureMemberData(item, chnl.guild, memberCache);
 
         // Date Separators: Insert a visual "March 15, 2024" bar when the day changes.
-        if (areDifferentDays(item.createdAt, state.lastmessagedate, clientTimezone))
-            response += renderTemplate(templates.dateSeparator, {
-                '{$DATE_SEPARATOR}': formatDateSeparator(item.createdAt, clientTimezone),
-            });
+        // Appended once any group split below has been flushed, so it stays in order.
+        const dateSeparatorHtml = areDifferentDays(
+            item.createdAt,
+            state.lastmessagedate,
+            clientTimezone
+        )
+            ? renderTemplate(templates.dateSeparator, {
+                  '{$DATE_SEPARATOR}': formatDateSeparator(item.createdAt, clientTimezone),
+              })
+            : '';
 
         state.lastmessagedate = item.createdAt;
 
+        // System messages (pins, boosts, "started a thread", ...) carry references to
+        // the pinned message or the thread; those are not replies or forwards.
+        const isSystem = !isNormalMessage(item.type);
+
         // Forwarded Messages: Extract content from reference or snapshots.
         const fwdData =
-            item.reference?.type === MessageReferenceType.Forward
+            !isSystem && item.reference?.type === MessageReferenceType.Forward
                 ? await resolveForwardData(
                       item,
                       chnl,
@@ -2065,15 +2546,13 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
 
         // Replies: Extract the referenced message and its author.
         const rplyData =
-            item.reference && !isForwarded
+            item.reference && !isForwarded && !isSystem
                 ? await resolveReplyData(
                       item,
                       chnl,
                       memberCache,
                       bot,
                       imagesCookie,
-                      animationsCookie,
-                      barColor,
                       authorText,
                       context
                   )
@@ -2099,18 +2578,71 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
         const startsNewGroup =
             !state.lastauthor ||
             !isSameAuthor(state.lastmember, state.lastauthor, currentMember, item.author) ||
-            item.createdAt - state.lastdate > MESSAGE_GROUP_TIMEOUT_MS ||
+            item.createdAt.getTime() - state.lastdate.getTime() > MESSAGE_GROUP_TIMEOUT_MS ||
             isReply ||
             isInteraction ||
             (currentIsDiscross && currentUserAgent !== state.lastUserAgent) ||
             (!currentIsDiscross && state.lastIsDiscross);
 
+        // Pins, boosts, thread notices and the like sit on their own compact row
+        // between groups, so close the open group first.
+        if (isSystem && isStandaloneSystemMessage(item, rawText)) {
+            if (state.currentmessage !== '') {
+                response += flushMessageGroup(
+                    state,
+                    templates,
+                    authorText,
+                    replyText,
+                    barColor,
+                    channelId
+                );
+                state.currentmessage = '';
+            }
+            response +=
+                dateSeparatorHtml +
+                `<a id="msg-${item.id}" name="msg-${item.id}"></a>` +
+                renderSystemMessageRow(
+                    item,
+                    currentMember,
+                    authorText,
+                    replyText,
+                    clientTimezone,
+                    imagesCookie
+                );
+            // The next message opens a new group under its own header.
+            state.lastauthor = undefined;
+            state.lastInteraction = false;
+            state.lastForwarded = false;
+            state.lastIsDiscross = false;
+            state.lastUserAgent = null;
+            continue;
+        }
+
+        // Only the messages that ping you are highlighted, so split the group
+        // where a ping starts or stops; the rest continues without a new header.
+        if (state.currentmessage !== '' && !startsNewGroup && isMentioned !== state.lastMentioned) {
+            response += flushMessageGroup(
+                state,
+                templates,
+                authorText,
+                replyText,
+                barColor,
+                channelId
+            );
+            state.currentmessage = '';
+        }
+
+        response += dateSeparatorHtml;
+
         // Apply "First" or "Merged" content templates.
         // First: Includes the message text and potential reactions.
         // Merged: Just appends the text below the previous message in the same group.
+        // Discord marks edited messages with a small "(edited)" after the text.
+        const displayText =
+            item.editedTimestamp && rawText ? rawText + templates.editedMarker : rawText;
         const wrappedText = startsNewGroup
-            ? renderTemplate(templates.firstMessageContent, { '{$MESSAGE_TEXT}': rawText })
-            : renderTemplate(templates.mergedMessageContent, { '{$MESSAGE_TEXT}': rawText });
+            ? renderTemplate(templates.firstMessageContent, { '{$MESSAGE_TEXT}': displayText })
+            : renderTemplate(templates.mergedMessageContent, { '{$MESSAGE_TEXT}': displayText });
 
         if (state.currentmessage === '') state.isContinuationBlock = !startsNewGroup;
 
@@ -2123,27 +2655,13 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
             animationsCookie
         );
 
-        const hasEmbeds = !!(item.embeds?.length || item.embeds?.size);
-
-        // Adjust reaction spacing if embeds are present.
-        const finalReactionsHtml =
-            hasEmbeds && reactionsHtml
-                ? reactionsHtml.replace('class="reactions"', 'class="reactions embed-reactions"')
-                : reactionsHtml;
-
         const withReactions = renderTemplate(wrappedText, {
-            '{$MESSAGE_REACTIONS}': finalReactionsHtml,
+            '{$MESSAGE_REACTIONS}': reactionsHtml,
         });
 
-        // 6. Handle System Messages.
-        const isSystem = !isNormalMessage(item.type);
-
+        // 6. Handle System Messages that keep the full layout (see isStandaloneSystemMessage).
         // Strip HTML to see if the message actually has visible content.
-        const visibleText = rawText
-            .replace(/<img\b[^>]*>/gi, 'x')
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
+        const visibleText = visibleTextOf(rawText);
 
         // Skip empty normal messages that have no attachments/embeds.
         if (
@@ -2160,7 +2678,8 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
             isSystem && visibleText.length === 0
                 ? render('channel/system-message', {
                       AUTHOR_NAME: formatAuthorName(getDisplayName(currentMember, item.author)),
-                      TEXT: SYSTEM_MESSAGE_TEXT[item.type] ?? 'performed an action',
+                      COLOR: replyText,
+                      TEXT: getSystemMessageText(item),
                   })
                 : withReactions;
 
@@ -2199,8 +2718,11 @@ exports.buildMessagesHtml = async function buildMessagesHtml(params) {
     }
     // Cleanup anchors and add the final scrolling target.
     response = removeExistingEndAnchors(response);
+    // Everything above is built from Discord-controlled text; keep it from being
+    // read as page-template placeholders (see neutralizePlaceholders).
+    response = neutralizePlaceholders(response);
     response += getTemplate('end-anchor', 'channel');
-    return response;
+    return paginationHtml + response;
 };
 
 // Shared with the reply page, which renders its own preview of the quoted

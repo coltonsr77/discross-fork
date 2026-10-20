@@ -1,5 +1,5 @@
 'use strict';
-const Discord = require('discord');
+const Discord = require('discord.js');
 const dns = require('dns').promises;
 const https = require('https');
 
@@ -10,6 +10,14 @@ const mail = require('./mail');
 const cachelength = 100; // Length of message history
 const msghistory = new Map();
 const MSGHISTORY_MAX_CHANNELS = 100; // Max number of channels to keep in history cache
+
+// Messages fetched one at a time (reply and forward targets), keyed by message
+// ID. discord.js's own message cache is disabled, so without this every reply
+// on a page refetched its target from Discord on every load.
+const refMessages = new Map();
+const REF_MESSAGES_MAX = 2000;
+const REF_MESSAGE_TTL_MS = 10 * 60 * 1000;
+const refMessageFetches = new Map(); // in-flight fetches, so concurrent loads share one request
 
 async function safeReply(msg, content) {
     try {
@@ -38,14 +46,54 @@ if (guildMembersIntentEnabled) {
     intentsArray.push(Discord.GatewayIntentBits.GuildMembers);
 }
 
+// Without explicit cache limits, discord.js caches every user, member, channel,
+// and message it ever sees or fetches for the life of the process. Messages are
+// already tracked ourselves in msghistory (bounded, see above), so the built-in
+// message cache is disabled; members/users are capped with an eviction guard
+// that always keeps the bot's own member/user entries so permission checks
+// (e.g. channel.guild.members.me) keep working.
+const keepClientEntry = (value, key) => key === client.user?.id;
+
 const client = new Discord.Client({
     partials: [Discord.Partials.Message, Discord.Partials.Channel, Discord.Partials.Reaction],
     shards: 'auto',
     intents: intentsArray,
+    presence: {
+        activities: [
+            {
+                name: 'Custom Status',
+                type: Discord.ActivityType.Custom,
+                state: 'https://discross.net/',
+            },
+        ],
+    },
+    makeCache: Discord.Options.cacheWithLimits({
+        ...Discord.Options.DefaultMakeCacheSettings,
+        MessageManager: 0,
+        // Shared by every guild: too small a cap and each page load refetches
+        // the authors it renders. A cached member is a few KB, so this stays small.
+        GuildMemberManager: { maxSize: 2000, keepOverLimit: keepClientEntry },
+        UserManager: { maxSize: 2000, keepOverLimit: keepClientEntry },
+        // Reactions are rendered from message.reactions.cache, so it can't be zero:
+        // a size-0 cache stores nothing and every reaction disappears. Discord
+        // allows at most 20 distinct reactions per message, so 25 is already bounded.
+        ReactionManager: 25,
+        ReactionUserManager: 0,
+        PresenceManager: 0,
+    }),
 });
 
 client.on('clientReady', async () => {
     console.info(`Logged in as ${client.user.tag}!`);
+    client.user?.setPresence({
+        activities: [
+            {
+                name: 'Custom Status',
+                type: Discord.ActivityType.Custom,
+                state: 'https://discross.net/',
+            },
+        ],
+    });
     try {
         await client.application.commands.set([
             {
@@ -75,333 +123,355 @@ client.on('clientReady', async () => {
 client.on('interactionCreate', async (interaction) => {
     try {
         if (interaction.isChatInputCommand()) {
-        const { commandName } = interaction;
+            const { commandName } = interaction;
 
-        if (commandName === 'connect') {
-            if (!(await shouldSendDM())) {
-                return;
-            }
-            try {
-                await interaction.user.send(
-                    `Verification code:\n\`${await auth.createVerificationCode(interaction.user.id)}\``
-                );
-                await interaction.reply({
-                    content: 'You have been sent a direct message with your verification code.',
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            } catch (e) {
+            if (commandName === 'connect') {
+                if (!(await shouldSendDM())) {
+                    return;
+                }
+                try {
+                    await interaction.user.send(
+                        `Verification code:\n\`${await auth.createVerificationCode(interaction.user.id)}\``
+                    );
+                    await interaction.reply({
+                        content: 'You have been sent a direct message with your verification code.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                } catch (e) {
+                    await interaction.reply({
+                        content:
+                            'Your verification code could not be sent. Please make sure you have direct messages enabled and try again.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+            } else if (commandName === 'help') {
                 await interaction.reply({
                     content:
-                        'Your verification code could not be sent. Please make sure you have direct messages enabled and try again.',
-                    flags: Discord.MessageFlags.Ephemeral,
+                        '**Discross Bot Commands:**\n`^connect` or `/connect` - Link your Discord account to Discross\n`^guest` or `/guest` - Toggle guest access for this channel (requires Manage Channel permission)\n`^help` or `/help` - Show this help message',
                 });
-            }
-        } else if (commandName === 'help') {
-            await interaction.reply({
-                content:
-                    '**Discross Bot Commands:**\n`^connect` or `/connect` - Link your Discord account to Discross\n`^guest` or `/guest` - Toggle guest access for this channel (requires Manage Channel permission)\n`^help` or `/help` - Show this help message',
-            });
-        } else if (commandName === 'guest') {
-            if (!interaction.guild) {
-                await interaction.reply({
-                    content: 'This command can only be used in a server channel.',
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-                return;
-            }
-            try {
-                const member = interaction.member;
-                if (
-                    !member
-                        .permissionsIn(interaction.channel)
-                        .has(Discord.PermissionFlagsBits.ManageChannels)
-                ) {
+            } else if (commandName === 'guest') {
+                if (!interaction.guild) {
                     await interaction.reply({
-                        content: 'You need the Manage Channel permission to use this command.',
+                        content: 'This command can only be used in a server channel.',
                         flags: Discord.MessageFlags.Ephemeral,
                     });
                     return;
                 }
-                const enabled = auth.toggleGuestChannel(interaction.channelId);
+                try {
+                    // memberPermissions is resolved by Discord for this channel, so
+                    // it works even when the member isn't in the bot's cache.
+                    if (
+                        !interaction.memberPermissions?.has(
+                            Discord.PermissionFlagsBits.ManageChannels
+                        )
+                    ) {
+                        await interaction.reply({
+                            content: 'You need the Manage Channel permission to use this command.',
+                            flags: Discord.MessageFlags.Ephemeral,
+                        });
+                        return;
+                    }
+                    const enabled = auth.toggleGuestChannel(interaction.channelId);
+                    await interaction.reply({
+                        content: `Guest access for this channel has been **${enabled ? 'enabled' : 'disabled'}**.`,
+                    });
+                } catch (e) {
+                    await interaction.reply({
+                        content: 'An error occurred while toggling guest access.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+            } else if (commandName === 'mail') {
+                if (interaction.guild) {
+                    return interaction.reply({
+                        content: 'This command can only be used in DMs with the bot.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                const row = new Discord.ActionRowBuilder().addComponents(
+                    new Discord.ButtonBuilder()
+                        .setCustomId('mail_register')
+                        .setLabel('Register Email')
+                        .setStyle(Discord.ButtonStyle.Primary),
+                    new Discord.ButtonBuilder()
+                        .setCustomId('mail_verify')
+                        .setLabel('Verify Code')
+                        .setStyle(Discord.ButtonStyle.Success),
+                    new Discord.ButtonBuilder()
+                        .setCustomId('mail_toggle')
+                        .setLabel('Toggle Opt-In/Out')
+                        .setStyle(Discord.ButtonStyle.Secondary),
+                    new Discord.ButtonBuilder()
+                        .setCustomId('mail_send')
+                        .setLabel('Send Email')
+                        .setStyle(Discord.ButtonStyle.Primary)
+                );
                 await interaction.reply({
-                    content: `Guest access for this channel has been **${enabled ? 'enabled' : 'disabled'}**.`,
+                    content:
+                        '**Discross Mail System**\nUse the buttons below to manage your email account.',
+                    components: [row],
+                    flags: Discord.MessageFlags.Ephemeral,
                 });
-            } catch (e) {
+            }
+        }
+
+        if (interaction.isButton()) {
+            const { customId } = interaction;
+            if (customId === 'mail_register') {
+                const user = auth.getMailUser(interaction.user.id);
+                if (user) {
+                    return interaction.reply({
+                        content: `You are already registered with \`${user.email_prefix}@mail.discross.net\`. Email prefix cannot be changed.`,
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                const modal = new Discord.ModalBuilder()
+                    .setCustomId('mail_register_modal')
+                    .setTitle('Register Email');
+                modal.addComponents(
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('prefix')
+                            .setLabel('Desired Email Prefix (before @)')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setMinLength(5)
+                            .setMaxLength(32)
+                            .setRequired(true)
+                    ),
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('backup')
+                            .setLabel('Backup Email (for verification)')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setRequired(true)
+                    )
+                );
+                await interaction.showModal(modal);
+            } else if (customId === 'mail_verify') {
+                const modal = new Discord.ModalBuilder()
+                    .setCustomId('mail_verify_modal')
+                    .setTitle('Verify Email');
+                modal.addComponents(
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('code')
+                            .setLabel('6-Digit Verification Code')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setMinLength(6)
+                            .setMaxLength(6)
+                            .setRequired(true)
+                    )
+                );
+                await interaction.showModal(modal);
+            } else if (customId === 'mail_toggle') {
+                const res = auth.toggleMailOptOut(interaction.user.id);
+                if (!res.success) {
+                    return interaction.reply({
+                        content: res.error,
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                return interaction.reply({
+                    content: `Your email account is now **${res.active ? 'Active' : 'Disabled (Opted Out)'}**.`,
+                    flags: Discord.MessageFlags.Ephemeral,
+                });
+            } else if (customId.startsWith('mail_block:')) {
+                const blockEmail = customId.split(':').slice(1).join(':');
+                const alreadyBlocked = auth.isMailBlocked(interaction.user.id, blockEmail);
+
+                if (alreadyBlocked) {
+                    auth.removeMailBlock(interaction.user.id, blockEmail);
+                } else {
+                    auth.addMailBlock(interaction.user.id, blockEmail);
+                }
+                const nowBlocked = !alreadyBlocked;
+
+                const rows = interaction.message.components.map((row) =>
+                    new Discord.ActionRowBuilder().addComponents(
+                        row.components.map((component) => {
+                            const builder = Discord.ButtonBuilder.from(component);
+                            if (component.customId === customId) {
+                                builder
+                                    .setLabel(nowBlocked ? 'Unblock Sender' : 'Block Sender')
+                                    .setStyle(
+                                        nowBlocked
+                                            ? Discord.ButtonStyle.Secondary
+                                            : Discord.ButtonStyle.Danger
+                                    );
+                            }
+                            return builder;
+                        })
+                    )
+                );
+                await interaction.update({ components: rows }).catch(() => {});
+
+                return interaction.followUp({
+                    content: nowBlocked
+                        ? `Successfully blocked \`${blockEmail}\`.`
+                        : `Successfully unblocked \`${blockEmail}\`.`,
+                    flags: Discord.MessageFlags.Ephemeral,
+                });
+            } else if (customId === 'mail_delete') {
+                await interaction.deferUpdate().catch(() => {});
+                await interaction.message.delete().catch(() => {});
+            } else if (customId === 'mail_send') {
+                const user = auth.getMailUser(interaction.user.id);
+                if (!user || !user.active) {
+                    return interaction.reply({
+                        content:
+                            'You need to register and verify your email account first before you can send emails.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                const modal = new Discord.ModalBuilder()
+                    .setCustomId('mail_send_modal')
+                    .setTitle('Send New Email');
+                modal.addComponents(
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('to')
+                            .setLabel('To (Recipient Email Address)')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setPlaceholder('recipient@example.com')
+                            .setRequired(true)
+                    ),
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('subject')
+                            .setLabel('Subject')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setPlaceholder('Enter subject')
+                            .setRequired(false)
+                    ),
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('body')
+                            .setLabel('Message Body')
+                            .setStyle(Discord.TextInputStyle.Paragraph)
+                            .setPlaceholder('Write your message here...')
+                            .setRequired(true)
+                    )
+                );
+                await interaction.showModal(modal);
+            } else if (customId.startsWith('mail_reply:')) {
+                const replyTo = customId.split(':').slice(1).join(':');
+                const modal = new Discord.ModalBuilder()
+                    .setCustomId(`mail_reply_modal:${replyTo}`)
+                    .setTitle(`Reply to ${replyTo.substring(0, 20)}`);
+                modal.addComponents(
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('subject')
+                            .setLabel('Subject')
+                            .setStyle(Discord.TextInputStyle.Short)
+                            .setRequired(false)
+                    ),
+                    new Discord.ActionRowBuilder().addComponents(
+                        new Discord.TextInputBuilder()
+                            .setCustomId('body')
+                            .setLabel('Message Body')
+                            .setStyle(Discord.TextInputStyle.Paragraph)
+                            .setRequired(true)
+                    )
+                );
+                await interaction.showModal(modal);
+            }
+        }
+
+        if (interaction.isModalSubmit()) {
+            if (interaction.customId === 'mail_register_modal') {
+                const prefix = interaction.fields.getTextInputValue('prefix').toLowerCase();
+                const backup = interaction.fields.getTextInputValue('backup');
+
+                if (!/^[a-z0-9._-]+$/.test(prefix)) {
+                    return interaction.reply({
+                        content:
+                            'Invalid prefix. Use only alphanumeric characters, dots, underscores, or dashes.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                if (auth.getMailUserByEmail(prefix)) {
+                    return interaction.reply({
+                        content: `The email prefix \`${prefix}\` is already taken.`,
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+
+                if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(backup) || backup.length > 254) {
+                    return interaction.reply({
+                        content: 'Please enter a valid backup email address.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+
+                const code = auth.createMailVerificationCode(interaction.user.id, prefix, backup);
+                const sent = await mail.sendVerificationEmail(
+                    backup,
+                    code,
+                    interaction.user.username
+                );
+                if (!sent.success) {
+                    return interaction.reply({
+                        content:
+                            'The verification email could not be sent. Please try again later.',
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+
                 await interaction.reply({
-                    content: 'An error occurred while toggling guest access.',
+                    content: `A verification code has been sent to \`${backup}\`! Click the "Verify Code" button to enter it.`,
                     flags: Discord.MessageFlags.Ephemeral,
                 });
-            }
-        } else if (commandName === 'mail') {
-            if (interaction.guild) {
-                return interaction.reply({
-                    content: 'This command can only be used in DMs with the bot.',
+            } else if (interaction.customId === 'mail_verify_modal') {
+                const code = interaction.fields.getTextInputValue('code');
+                const res = auth.verifyMailCode(interaction.user.id, code);
+                if (!res.success) {
+                    return interaction.reply({
+                        content: res.error,
+                        flags: Discord.MessageFlags.Ephemeral,
+                    });
+                }
+                auth.setMailUser(interaction.user.id, res.email_prefix, 1);
+                await interaction.reply({
+                    content: `Successfully registered \`${res.email_prefix}@mail.discross.net\`! You are now opted in to receive emails.`,
                     flags: Discord.MessageFlags.Ephemeral,
                 });
-            }
-            const row = new Discord.ActionRowBuilder().addComponents(
-                new Discord.ButtonBuilder()
-                    .setCustomId('mail_register')
-                    .setLabel('Register Email')
-                    .setStyle(Discord.ButtonStyle.Primary),
-                new Discord.ButtonBuilder()
-                    .setCustomId('mail_verify')
-                    .setLabel('Verify Code')
-                    .setStyle(Discord.ButtonStyle.Success),
-                new Discord.ButtonBuilder()
-                    .setCustomId('mail_toggle')
-                    .setLabel('Toggle Opt-In/Out')
-                    .setStyle(Discord.ButtonStyle.Secondary),
-                new Discord.ButtonBuilder()
-                    .setCustomId('mail_send')
-                    .setLabel('Send Email')
-                    .setStyle(Discord.ButtonStyle.Primary)
-            );
-            await interaction.reply({
-                content:
-                    '**Discross Mail System**\nUse the buttons below to manage your email account.',
-                components: [row],
-                flags: Discord.MessageFlags.Ephemeral,
-            });
-        }
-    }
+            } else if (interaction.customId === 'mail_send_modal') {
+                const toAddress = interaction.fields.getTextInputValue('to');
+                const subject = interaction.fields.getTextInputValue('subject') || 'No Subject';
+                const body = interaction.fields.getTextInputValue('body');
 
-    if (interaction.isButton()) {
-        const { customId } = interaction;
-        if (customId === 'mail_register') {
-            const user = auth.getMailUser(interaction.user.id);
-            if (user) {
-                return interaction.reply({
-                    content: `You are already registered with \`${user.email_prefix}@mail.discross.net\`. Email prefix cannot be changed.`,
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-            const modal = new Discord.ModalBuilder()
-                .setCustomId('mail_register_modal')
-                .setTitle('Register Email');
-            modal.addComponents(
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('prefix')
-                        .setLabel('Desired Email Prefix (before @)')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setMinLength(5)
-                        .setMaxLength(32)
-                        .setRequired(true)
-                ),
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('backup')
-                        .setLabel('Backup Email (for verification)')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setRequired(true)
-                )
-            );
-            await interaction.showModal(modal);
-        } else if (customId === 'mail_verify') {
-            const modal = new Discord.ModalBuilder()
-                .setCustomId('mail_verify_modal')
-                .setTitle('Verify Email');
-            modal.addComponents(
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('code')
-                        .setLabel('6-Digit Verification Code')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setMinLength(6)
-                        .setMaxLength(6)
-                        .setRequired(true)
-                )
-            );
-            await interaction.showModal(modal);
-        } else if (customId === 'mail_toggle') {
-            const res = auth.toggleMailOptOut(interaction.user.id);
-            if (!res.success) {
-                return interaction.reply({
-                    content: res.error,
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-            return interaction.reply({
-                content: `Your email account is now **${res.active ? 'Active' : 'Disabled (Opted Out)'}**.`,
-                flags: Discord.MessageFlags.Ephemeral,
-            });
-        } else if (customId.startsWith('mail_block:')) {
-            const blockEmail = customId.split(':').slice(1).join(':');
-            const alreadyBlocked = auth.isMailBlocked(interaction.user.id, blockEmail);
+                await interaction.deferReply({ flags: Discord.MessageFlags.Ephemeral });
+                const res = await mail.sendEmail(interaction.user.id, toAddress, subject, body);
+                if (res.success) {
+                    await interaction.editReply({
+                        content: `Successfully sent email to \`${toAddress}\`!`,
+                    });
+                } else {
+                    await interaction.editReply({ content: `Failed to send email: ${res.error}` });
+                }
+            } else if (interaction.customId.startsWith('mail_reply_modal:')) {
+                const replyTo = interaction.customId.split(':').slice(1).join(':');
+                const subject = interaction.fields.getTextInputValue('subject') || 'Re: ';
+                const body = interaction.fields.getTextInputValue('body');
 
-            if (alreadyBlocked) {
-                auth.removeMailBlock(interaction.user.id, blockEmail);
-            } else {
-                auth.addMailBlock(interaction.user.id, blockEmail);
-            }
-            const nowBlocked = !alreadyBlocked;
-
-            const rows = interaction.message.components.map((row) =>
-                new Discord.ActionRowBuilder().addComponents(
-                    row.components.map((component) => {
-                        const builder = Discord.ButtonBuilder.from(component);
-                        if (component.customId === customId) {
-                            builder
-                                .setLabel(nowBlocked ? 'Unblock Sender' : 'Block Sender')
-                                .setStyle(
-                                    nowBlocked
-                                        ? Discord.ButtonStyle.Secondary
-                                        : Discord.ButtonStyle.Danger
-                                );
-                        }
-                        return builder;
-                    })
-                )
-            );
-            await interaction.update({ components: rows }).catch(() => {});
-
-            return interaction.followUp({
-                content: nowBlocked
-                    ? `Successfully blocked \`${blockEmail}\`.`
-                    : `Successfully unblocked \`${blockEmail}\`.`,
-                flags: Discord.MessageFlags.Ephemeral,
-            });
-        } else if (customId === 'mail_delete') {
-            await interaction.deferUpdate().catch(() => {});
-            await interaction.message.delete().catch(() => {});
-        } else if (customId === 'mail_send') {
-            const user = auth.getMailUser(interaction.user.id);
-            if (!user || !user.active) {
-                return interaction.reply({
-                    content:
-                        'You need to register and verify your email account first before you can send emails.',
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-            const modal = new Discord.ModalBuilder()
-                .setCustomId('mail_send_modal')
-                .setTitle('Send New Email');
-            modal.addComponents(
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('to')
-                        .setLabel('To (Recipient Email Address)')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setPlaceholder('recipient@example.com')
-                        .setRequired(true)
-                ),
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('subject')
-                        .setLabel('Subject')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setPlaceholder('Enter subject')
-                        .setRequired(false)
-                ),
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('body')
-                        .setLabel('Message Body')
-                        .setStyle(Discord.TextInputStyle.Paragraph)
-                        .setPlaceholder('Write your message here...')
-                        .setRequired(true)
-                )
-            );
-            await interaction.showModal(modal);
-        } else if (customId.startsWith('mail_reply:')) {
-            const replyTo = customId.split(':').slice(1).join(':');
-            const modal = new Discord.ModalBuilder()
-                .setCustomId(`mail_reply_modal:${replyTo}`)
-                .setTitle(`Reply to ${replyTo.substring(0, 20)}`);
-            modal.addComponents(
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('subject')
-                        .setLabel('Subject')
-                        .setStyle(Discord.TextInputStyle.Short)
-                        .setRequired(false)
-                ),
-                new Discord.ActionRowBuilder().addComponents(
-                    new Discord.TextInputBuilder()
-                        .setCustomId('body')
-                        .setLabel('Message Body')
-                        .setStyle(Discord.TextInputStyle.Paragraph)
-                        .setRequired(true)
-                )
-            );
-            await interaction.showModal(modal);
-        }
-    }
-
-    if (interaction.isModalSubmit()) {
-        if (interaction.customId === 'mail_register_modal') {
-            const prefix = interaction.fields.getTextInputValue('prefix').toLowerCase();
-            const backup = interaction.fields.getTextInputValue('backup');
-
-            if (!/^[a-z0-9._-]+$/.test(prefix)) {
-                return interaction.reply({
-                    content:
-                        'Invalid prefix. Use only alphanumeric characters, dots, underscores, or dashes.',
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-            if (auth.getMailUserByEmail(prefix)) {
-                return interaction.reply({
-                    content: `The email prefix \`${prefix}\` is already taken.`,
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-
-            const code = auth.createMailVerificationCode(interaction.user.id, prefix, backup);
-            await mail.sendVerificationEmail(backup, code, interaction.user.username);
-
-            await interaction.reply({
-                content: `A verification code has been sent to \`${backup}\`! Click the "Verify Code" button to enter it.`,
-                flags: Discord.MessageFlags.Ephemeral,
-            });
-        } else if (interaction.customId === 'mail_verify_modal') {
-            const code = interaction.fields.getTextInputValue('code');
-            const res = auth.verifyMailCode(interaction.user.id, code);
-            if (!res.success) {
-                return interaction.reply({
-                    content: res.error,
-                    flags: Discord.MessageFlags.Ephemeral,
-                });
-            }
-            auth.setMailUser(interaction.user.id, res.email_prefix, 1);
-            await interaction.reply({
-                content: `Successfully registered \`${res.email_prefix}@mail.discross.net\`! You are now opted in to receive emails.`,
-                flags: Discord.MessageFlags.Ephemeral,
-            });
-        } else if (interaction.customId === 'mail_send_modal') {
-            const toAddress = interaction.fields.getTextInputValue('to');
-            const subject = interaction.fields.getTextInputValue('subject') || 'No Subject';
-            const body = interaction.fields.getTextInputValue('body');
-
-            await interaction.deferReply({ flags: Discord.MessageFlags.Ephemeral });
-            const res = await mail.sendEmail(interaction.user.id, toAddress, subject, body);
-            if (res.success) {
-                await interaction.editReply({
-                    content: `Successfully sent email to \`${toAddress}\`!`,
-                });
-            } else {
-                await interaction.editReply({ content: `Failed to send email: ${res.error}` });
-            }
-        } else if (interaction.customId.startsWith('mail_reply_modal:')) {
-            const replyTo = interaction.customId.split(':').slice(1).join(':');
-            const subject = interaction.fields.getTextInputValue('subject') || 'Re: ';
-            const body = interaction.fields.getTextInputValue('body');
-
-            await interaction.deferReply({ flags: Discord.MessageFlags.Ephemeral });
-            const res = await mail.sendEmail(interaction.user.id, replyTo, subject, body);
-            if (res.success) {
-                await interaction.editReply({ content: `Successfully replied to \`${replyTo}\`!` });
-            } else {
-                await interaction.editReply({ content: `Failed to send reply: ${res.error}` });
+                await interaction.deferReply({ flags: Discord.MessageFlags.Ephemeral });
+                const res = await mail.sendEmail(interaction.user.id, replyTo, subject, body);
+                if (res.success) {
+                    await interaction.editReply({
+                        content: `Successfully replied to \`${replyTo}\`!`,
+                    });
+                } else {
+                    await interaction.editReply({ content: `Failed to send reply: ${res.error}` });
+                }
             }
         }
-    }
     } catch (err) {
         if (
             err.code === 10062 ||
             err.code === 40060 ||
-            (err.message && (err.message.includes('10062') || err.message.includes('Unknown interaction')))
+            (err.message &&
+                (err.message.includes('10062') || err.message.includes('Unknown interaction')))
         ) {
             console.warn('Interaction expired or already handled:', err.message);
             return;
@@ -518,7 +588,7 @@ client.on('messageCreate', async function (msg) {
                 if (footerText.startsWith('To: ')) {
                     const replyTo = embed.author.name;
                     const subject = `Re: ${embed.title || 'Email'}`;
-                    let body = msg.content;
+                    const body = msg.content;
                     const attachments = [];
                     msg.attachments.forEach((att) => {
                         attachments.push({ filename: att.name, path: att.url });
@@ -576,12 +646,16 @@ client.on('messageUpdate', async function (oldMsg, newMsg) {
     ) {
         msghistory.get(newMsg.channel.id).set(newMsg.id, newMsg);
     }
+    if (refMessages.has(newMsg.id)) {
+        refMessages.set(newMsg.id, { msg: newMsg, at: Date.now() });
+    }
 });
 
 client.on('messageDelete', async function (msg) {
     if (msg.channel && msghistory.has(msg.channel.id)) {
         msghistory.get(msg.channel.id).delete(msg.id);
     }
+    refMessages.delete(msg.id);
 });
 
 client.on('messageDeleteBulk', async function (messages) {
@@ -589,6 +663,7 @@ client.on('messageDeleteBulk', async function (messages) {
         if (msg.channel && msghistory.has(msg.channel.id)) {
             msghistory.get(msg.channel.id).delete(msg.id);
         }
+        refMessages.delete(msg.id);
     });
 });
 
@@ -675,7 +750,7 @@ async function backfillHistory(chnl, alreadyFetched) {
     }
 }
 
-exports.getHistoryCached = async function (chnl, desiredLimit) {
+exports.getHistoryCached = async function (chnl, desiredLimit, beforeId, aroundId) {
     if (typeof chnl === 'string') {
         chnl =
             client.channels.cache.get(chnl) ||
@@ -684,6 +759,44 @@ exports.getHistoryCached = async function (chnl, desiredLimit) {
     if (!chnl || !chnl.id) {
         return [];
     }
+
+    if (aroundId) {
+        try {
+            const messagearray = await chnl.messages.fetch({
+                limit: Math.min(desiredLimit != null ? desiredLimit : 50, 100),
+                around: aroundId,
+            });
+            return (Array.from(messagearray.values()) as any[]).sort(
+                (messageA, messageB) => messageA.createdTimestamp - messageB.createdTimestamp
+            );
+        } catch (err) {
+            console.error(
+                `Failed to fetch messages for channel ${chnl.id} around ${aroundId}:`,
+                err
+            );
+            return [];
+        }
+    }
+
+    if (beforeId) {
+        try {
+            const fetchLimit = desiredLimit != null ? desiredLimit + 1 : 26;
+            const messagearray = await chnl.messages.fetch({
+                limit: Math.min(fetchLimit, 100),
+                before: beforeId,
+            });
+            return (Array.from(messagearray.values()) as any[]).sort(
+                (messageA, messageB) => messageA.createdTimestamp - messageB.createdTimestamp
+            );
+        } catch (err) {
+            console.error(
+                `Failed to fetch paginated messages for channel ${chnl.id} before ${beforeId}:`,
+                err
+            );
+            return [];
+        }
+    }
+
     if (!msghistory.has(chnl.id)) {
         try {
             // FIFO eviction for channels
@@ -696,7 +809,7 @@ exports.getHistoryCached = async function (chnl, desiredLimit) {
             // just going to slice off anyway. Discord.js will try to populate
             // member data automatically if available in cache.
             const initialLimit =
-                desiredLimit != null ? Math.min(desiredLimit, cachelength) : cachelength;
+                desiredLimit != null ? Math.min(desiredLimit + 1, cachelength) : cachelength;
             const messagearray = await chnl.messages.fetch({ limit: initialLimit });
             msghistory.set(
                 chnl.id,
@@ -717,6 +830,65 @@ exports.getHistoryCached = async function (chnl, desiredLimit) {
         }
     }
     return Array.from(msghistory.get(chnl.id).values());
+};
+
+// Fetches one message the way Message#fetchReference does, but answers from
+// the channel history or the recent-reference cache when it can. Throws like
+// fetchReference when the channel or message can't be reached.
+exports.getMessageCached = async function (channelId, messageId) {
+    const fromHistory = msghistory.get(channelId)?.get(messageId);
+    if (fromHistory) return fromHistory;
+
+    const cached = refMessages.get(messageId);
+    if (cached && Date.now() - cached.at < REF_MESSAGE_TTL_MS) return cached.msg;
+
+    const pending = refMessageFetches.get(messageId);
+    if (pending) return pending;
+
+    const fetchPromise = (async () => {
+        const channel = client.channels.resolve(channelId);
+        if (!channel) throw new Error(`Channel ${channelId} is not available`);
+        const msg = await channel.messages.fetch(messageId);
+        refMessages.delete(messageId);
+        if (refMessages.size >= REF_MESSAGES_MAX) {
+            refMessages.delete(refMessages.keys().next().value);
+        }
+        refMessages.set(messageId, { msg, at: Date.now() });
+        return msg;
+    })();
+    refMessageFetches.set(messageId, fetchPromise);
+    try {
+        return await fetchPromise;
+    } finally {
+        refMessageFetches.delete(messageId);
+    }
+};
+
+// Discord's message search (GET /guilds/{id}/messages/search) isn't part of
+// the official documented API, so discord.js has no typed wrapper for it —
+// call it directly through the low-level REST manager. Requires the
+// MESSAGE_CONTENT intent (already enabled above) and READ_MESSAGE_HISTORY in
+// the searched channels.
+exports.searchGuildMessages = async function (guildId, { content, channelIds, limit, offset }) {
+    const query = new URLSearchParams();
+    if (content) query.set('content', content);
+    for (const id of channelIds || []) query.append('channel_id', id);
+    query.set('limit', String(Math.min(limit || 25, 25)));
+    if (offset) query.set('offset', String(offset));
+
+    const data: any = await client.rest.get(`/guilds/${guildId}/messages/search`, { query });
+
+    // While the guild's search index is still being built, Discord returns a
+    // 200/202 with no messages array and a retry_after hint instead of an
+    // error — retry once after that delay rather than reporting zero results.
+    if (!data.messages && data.retry_after != null) {
+        await new Promise((resolve) =>
+            setTimeout(resolve, Math.min(data.retry_after * 1000, 5000))
+        );
+        return client.rest.get(`/guilds/${guildId}/messages/search`, { query });
+    }
+
+    return data;
 };
 
 exports.client = client;

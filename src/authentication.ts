@@ -11,7 +11,7 @@ const otplib = require('otplib');
 const qrcode = require('qrcode');
 const crypto = require('crypto');
 const webauthn = require('./webauthn');
-const { getTemplate, renderTemplate } = require('../pages/utils');
+const { getTemplate, renderTemplate, toLocalPath } = require('../pages/utils');
 
 // --- WebAuthn challenge store ------------------------------------------------
 // Passkey ceremonies are two requests (options → verify). We must remember the
@@ -21,11 +21,19 @@ const { getTemplate, renderTemplate } = require('../pages/utils');
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const _passkeyChallenges = new Map();
 
+// /passkey/options?type=login is open to anonymous callers, so the store has to
+// stay bounded however fast challenges are requested.
+const MAX_PASSKEY_CHALLENGES = 5000;
+
 function storePasskeyChallenge(challengeB64url, meta) {
     // Opportunistic cleanup of expired challenges.
     const now = Date.now();
     for (const [key, val] of _passkeyChallenges) {
         if (val.expires <= now) _passkeyChallenges.delete(key);
+    }
+    // Maps iterate in insertion order, so the first keys are the oldest.
+    while (_passkeyChallenges.size >= MAX_PASSKEY_CHALLENGES) {
+        _passkeyChallenges.delete(_passkeyChallenges.keys().next().value);
     }
     _passkeyChallenges.set(challengeB64url, { ...meta, expires: now + CHALLENGE_TTL_MS });
 }
@@ -94,6 +102,19 @@ function setup() {
         queryRun('ALTER TABLE users ADD COLUMN discord_refresh_token TEXT');
         queryRun('ALTER TABLE users ADD COLUMN discord_token_expires INTEGER');
     } catch (_) {}
+    // One-time migration: Discord OAuth tokens were only kept for the removed
+    // NSFW age check. Nothing reads them any more, so don't keep them around.
+    try {
+        queryRun('CREATE TABLE discord_tokens_cleared_v1 (done INTEGER)');
+        queryRun(
+            'UPDATE users SET discord_access_token=NULL, discord_refresh_token=NULL, discord_token_expires=NULL'
+        );
+    } catch {
+        // Migration already ran
+    }
+    queryRun(
+        'CREATE TABLE IF NOT EXISTS age_confirmations (discordID TEXT PRIMARY KEY, confirmed INT)'
+    );
     queryRun('CREATE TABLE IF NOT EXISTS sessions (discordID TEXT, sessionID STRING, expires INT)');
     queryRun('CREATE TABLE IF NOT EXISTS webhooks (serverID TEXT, webhookID TEXT, token STRING)');
     queryRun(
@@ -104,6 +125,9 @@ function setup() {
     );
     queryRun(
         'CREATE TABLE IF NOT EXISTS channel_preferences (discordID TEXT, serverID TEXT, channelID TEXT, collapsed INTEGER DEFAULT 0, PRIMARY KEY (discordID, serverID, channelID))'
+    );
+    queryRun(
+        'CREATE TABLE IF NOT EXISTS server_order (discordID TEXT, serverID TEXT, position INTEGER, PRIMARY KEY (discordID, serverID))'
     );
     queryRun(
         'CREATE TABLE IF NOT EXISTS pending_totp (discordID TEXT PRIMARY KEY, secret TEXT, expires INT)'
@@ -219,6 +243,10 @@ const LOGIN_MAX_FAILS = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const CODE_MAX_FAILS = 5;
 const CODE_WINDOW_MS = 10 * 60 * 1000;
+// Registration and account-reset codes aren't tied to an account until they're
+// matched, so failures are counted per client and across the whole server.
+const SIGNUP_CODE_MAX_FAILS_PER_CLIENT = 10;
+const SIGNUP_CODE_MAX_FAILS_GLOBAL = 100;
 
 // --- Validation Helpers ---
 
@@ -381,7 +409,7 @@ exports.createVerificationCode = async function (discordID) {
     if (match) {
         return match.code;
     }
-    const generatedCode = uuidv4().slice(0, 8) + 'a' + uuidv4().slice(9, 10);
+    const generatedCode = crypto.randomBytes(5).toString('hex');
     queryRun('INSERT INTO verificationcodes VALUES (?,?,?)', [
         discordID,
         generatedCode,
@@ -390,14 +418,47 @@ exports.createVerificationCode = async function (discordID) {
     return generatedCode;
 };
 
-exports.checkVerificationCode = async function (code) {
+/**
+ * The address to rate-limit a request by. Behind a reverse proxy the socket is
+ * always the proxy, and the first X-Forwarded-For entry is whatever the client
+ * chose to send, so use the last hop: the one our own proxy appended.
+ */
+function rateLimitClientKey(req) {
+    const forwarded = String(req?.headers?.['x-forwarded-for'] || '');
+    const lastHop = forwarded.split(',').pop().trim();
+    return lastHop || req?.socket?.remoteAddress || 'unknown';
+}
+
+/**
+ * Looks up the Discord account a register/forgot verification code belongs to.
+ * Guessing is throttled so the 10-character code can't be brute-forced to claim
+ * or reset someone else's account.
+ *
+ * @param {string} code - The code the visitor typed.
+ * @param {object} [req] - The request, used to throttle per client.
+ * @returns {Promise<string|false>} The Discord ID, or false for an unknown code or a throttled caller.
+ */
+exports.checkVerificationCode = async function (code, req) {
+    const clientKey = `signupcode:${rateLimitClientKey(req)}`;
+    const globalKey = 'signupcode:global';
+    if (
+        isRateLimited(clientKey, SIGNUP_CODE_MAX_FAILS_PER_CLIENT) ||
+        isRateLimited(globalKey, SIGNUP_CODE_MAX_FAILS_GLOBAL)
+    ) {
+        return false;
+    }
     const time = unixTime();
     queryRun('DELETE FROM verificationcodes WHERE NOT expires > ?', [time]);
     const match = querySingle(
         'SELECT DISTINCT discordID FROM verificationcodes WHERE code=? AND expires > ?',
-        [code, time]
+        [String(code || '').trim(), time]
     );
-    return match ? match.discordID : false;
+    if (!match) {
+        registerFailure(clientKey, CODE_WINDOW_MS);
+        registerFailure(globalKey, CODE_WINDOW_MS);
+        return false;
+    }
+    return match.discordID;
 };
 
 /*
@@ -631,7 +692,7 @@ exports.checkAuth = async function (req, res, noRedirect) {
     }
 
     if (!noRedirect) {
-        res.writeHead(sessionIDToCheck ? 301 : 303, {
+        res.writeHead(303, {
             Location: `/login.html?redirect=${encodeURIComponent(req.url)}`,
         });
         res.end();
@@ -655,21 +716,16 @@ exports.handleLoginRegister = async function (req, res, body) {
             const result = await exports.login(params.username, params.password, params.totp_code);
             if (result.status === 'success') {
                 const cookieExpiry = new Date(Date.now() + expiryTime * 1000).toUTCString();
+                // Only ever redirect to a path on this site: the session ID is
+                // appended below, so an off-site target would leak it.
                 const redirectBase = (() => {
-                    try {
-                        const redirectUrl = new URL(
-                            params.redirect || '/server/',
-                            'http://localhost'
-                        );
-                        redirectUrl.searchParams.delete('sessionID');
-                        return (
-                            redirectUrl.pathname +
-                            (redirectUrl.search || '') +
-                            (redirectUrl.hash || '')
-                        );
-                    } catch {
-                        return params.redirect || '/server/';
-                    }
+                    const local = new URL(
+                        toLocalPath(params.redirect || '/server/', '/server/'),
+                        'http://localhost'
+                    );
+                    local.searchParams.delete('sessionID');
+                    local.hash = '';
+                    return local.pathname + local.search;
                 })();
                 const sep = redirectBase.includes('?') ? '&' : '?';
                 const redirectPath = `${redirectBase}${sep}sessionID=${encodeURIComponent(result.sessionID)}#end`;
@@ -700,7 +756,7 @@ exports.handleLoginRegister = async function (req, res, body) {
                 await require('../pages/register').processRegister(null, req, res, []);
                 return;
             }
-            const id = await exports.checkVerificationCode(params.token);
+            const id = await exports.checkVerificationCode(params.token, req);
             if (!id) {
                 req.url = `/register.html?errortext=${encodeURIComponent('Invalid verification code!\nType ^connect on a server with the Discross bot.')}`;
                 await require('../pages/register').processRegister(null, req, res, []);
@@ -708,7 +764,7 @@ exports.handleLoginRegister = async function (req, res, body) {
             }
             const result = await exports.createUser(id, params.username, params.password);
             if (result.status === 'success') {
-                res.writeHead(301, { Location: '/login.html' });
+                res.writeHead(303, { Location: '/login.html' });
                 res.end();
             } else {
                 req.url = `/register.html?errortext=${encodeURIComponent(result.reason)}`;
@@ -720,7 +776,7 @@ exports.handleLoginRegister = async function (req, res, body) {
         }
     } else if (req.url === '/forgot') {
         if (params.token) {
-            const id = await exports.checkVerificationCode(params.token);
+            const id = await exports.checkVerificationCode(params.token, req);
             if (!id) {
                 req.url = `/forgot.html?errortext=${encodeURIComponent('Invalid verification code!\nType ^connect on a server with the Discross bot.')}`;
                 await require('../pages/forgot').processForgot(null, req, res, []);
@@ -751,6 +807,33 @@ exports.insertServers = function (items) {
     return transaction(items);
 };
 
+exports.getServerOrder = function (discordID) {
+    const order = {};
+    for (const row of queryAll('SELECT serverID, position FROM server_order WHERE discordID=?', [
+        discordID,
+    ])) {
+        order[row.serverID] = row.position;
+    }
+    return order;
+};
+
+exports.setServerOrder = function (discordID, serverIDs) {
+    try {
+        const stmt = db.prepare(
+            'INSERT OR REPLACE INTO server_order (discordID, serverID, position) VALUES (?, ?, ?)'
+        );
+        db.transaction(function (ids) {
+            ids.forEach(function (id, i) {
+                stmt.run(discordID, id, i);
+            });
+        })(serverIDs);
+        return { success: true };
+    } catch (err) {
+        console.error('Error setting server order:', err);
+        return { success: false, error: err.message };
+    }
+};
+
 exports.getChannelPreferences = function (discordID, serverID) {
     return queryAll(
         'SELECT channelID, collapsed FROM channel_preferences WHERE discordID=? AND serverID=?',
@@ -771,6 +854,21 @@ exports.setChannelPreference = function (discordID, serverID, categoryID, collap
     }
 };
 
+// Discord's OAuth never reveals whether an account is age-verified, so
+// age-restricted channels are gated behind a one-time "I am 18 or older"
+// confirmation stored per Discross account.
+exports.hasConfirmedAdult = function (discordID) {
+    if (!discordID) return false;
+    return !!querySingle('SELECT 1 FROM age_confirmations WHERE discordID=?', [discordID]);
+};
+
+exports.confirmAdult = function (discordID) {
+    queryRun('INSERT OR REPLACE INTO age_confirmations (discordID, confirmed) VALUES (?,?)', [
+        discordID,
+        unixTime(),
+    ]);
+};
+
 exports.isGuestChannel = function (channelID) {
     return !!querySingle('SELECT 1 FROM guest_channels WHERE channelID=?', [channelID]);
 };
@@ -783,20 +881,6 @@ exports.toggleGuestChannel = function (channelID) {
         queryRun('INSERT INTO guest_channels VALUES (?)', [channelID]);
         return true;
     }
-};
-
-exports.saveDiscordTokens = function (discordID, accessToken, refreshToken, expiresAt) {
-    return queryRun(
-        'UPDATE users SET discord_access_token=?, discord_refresh_token=?, discord_token_expires=? WHERE discordID=?',
-        [accessToken, refreshToken, expiresAt, discordID]
-    );
-};
-
-exports.getDiscordTokens = function (discordID) {
-    return querySingle(
-        'SELECT discord_access_token, discord_refresh_token, discord_token_expires FROM users WHERE discordID=?',
-        [discordID]
-    );
 };
 
 exports.getPasskeyOptions = function (discordID, type = 'register', rpId = 'localhost') {

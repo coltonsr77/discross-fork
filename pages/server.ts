@@ -1,14 +1,10 @@
 'use strict';
-const fs = require('fs');
-const path = require('path');
-const { SnowTransfer } = require('snowtransfer');
-const sharp = require('sharp');
-const sanitizer = require('path-sanitizer').default;
 const escape = require('escape-html');
 const UAParser = require('ua-parser-js');
 const auth = require('../src/authentication');
 const emojiRegex = require('./twemojiRegex').regex;
-const { ChannelType, PermissionFlagsBits } = require('discord');
+const { ChannelType, PermissionFlagsBits } = require('discord.js');
+const { isNsfwChannel } = require('./nsfwUtils');
 const { normalizeWeirdUnicode } = require('./unicodeUtils');
 const { unicodeToTwemojiCode } = require('./emojiUtils');
 const {
@@ -26,27 +22,10 @@ const {
 // Templates for viewing the channels in a server
 const server_template = loadAndRenderPageTemplate('server');
 
-const text_channel_template = getTemplate('text-channel', 'channellist');
-const announcement_channel_template = getTemplate('announcement-channel', 'channellist');
-const category_channel_template = getTemplate('category-channel', 'channellist');
-const voice_channel_template = getTemplate('voice-channel', 'channellist');
-const thread_channel_template = getTemplate('thread-channel', 'channellist');
-const thread_group_header_template = getTemplate('thread-group-header', 'channellist');
-const forum_channel_template = getTemplate('forum-channel', 'channellist');
-const locked_channel_template = getTemplate('locked-channel', 'channellist');
-const rules_channel_template = getTemplate('rules-channel', 'channellist');
-const nsfw_channel_template = getTemplate('nsfw-channel', 'channellist');
-const { isNsfwChannel } = require('./nsfwUtils');
-const { isAgeVerified } = require('./ageVerification');
-
-const server_icon_template = getTemplate('server-icon', 'server');
-
 const server_list_only_template = getTemplate('server-list-only', 'server');
 const sync_warning_template = getTemplate('sync-warning', 'server');
 const no_images_warning_template = getTemplate('no-images-warning', 'server');
 const images_enabled_template = getTemplate('images-enabled', 'server');
-
-const logged_in_template = getTemplate('logged-in', 'index');
 
 const cachedMembers = {}; // TODO: Find a better way
 const MAX_CACHED_MEMBERS = 250; // evict oldest user's data when the cap is hit
@@ -64,7 +43,6 @@ const lock = new AsyncLock();
 async function processServerChannels(server, member, response, sessionParam) {
     try {
         const discordID = member.id;
-        const ageVerified = await isAgeVerified(discordID);
 
         // Fetch active threads for this server
         const activeThreadsList = await server.channels
@@ -175,12 +153,7 @@ async function processServerChannels(server, member, response, sessionParam) {
                     const canSendMessages = member
                         .permissionsIn(item)
                         .has(PermissionFlagsBits.SendMessages, true);
-                    if (isNsfwChannel(item) && !ageVerified) {
-                        channelList += render('channellist/nsfw-channel', {
-                            CHANNEL_NAME: escapedName,
-                            CHANNEL_LINK: `../channels/${item.id}${sessionParam}#end`,
-                        });
-                    } else if (!canSendMessages) {
+                    if (!canSendMessages) {
                         channelList += render('channellist/locked-channel', {
                             CHANNEL_NAME: escapedName,
                             CHANNEL_LINK: `../channels/${item.id}${sessionParam}#end`,
@@ -203,13 +176,13 @@ async function processServerChannels(server, member, response, sessionParam) {
 
                     const isRulesChannel = item.name.toLowerCase().includes('rule');
 
-                    if (isNsfwChannel(item) && !ageVerified) {
-                        channelList += render('channellist/nsfw-channel', {
+                    if (isRulesChannel) {
+                        channelList += render('channellist/rules-channel', {
                             CHANNEL_NAME: escapedName,
                             CHANNEL_LINK: `../channels/${item.id}${sessionParam}#end`,
                         });
-                    } else if (isRulesChannel) {
-                        channelList += render('channellist/rules-channel', {
+                    } else if (isNsfwChannel(item)) {
+                        channelList += render('channellist/nsfw-channel', {
                             CHANNEL_NAME: escapedName,
                             CHANNEL_LINK: `../channels/${item.id}${sessionParam}#end`,
                         });
@@ -268,7 +241,6 @@ async function processServerChannels(server, member, response, sessionParam) {
 exports.processServer = async function (bot, req, res, args, discordID) {
     try {
         let serverList = '';
-        let serversDeleted = 0; // Track if servers were deleted due to sync issues
         const clientIsReady = isBotReady(bot);
 
         if (!clientIsReady) {
@@ -298,13 +270,16 @@ exports.processServer = async function (bot, req, res, args, discordID) {
 
         // Acquire lock for this user to prevent race conditions where users might see other users' servers
         await lock.acquire(discordID, async () => {
-            // Trigger background refresh if we're on the main server list and bot is ready
-            if (!args[2] && clientIsReady) {
-                // We don't await this to keep the page load fast
-                refreshDiscordServers(bot, discordID).catch(console.warn);
-            }
-
             const data = auth.queryAll('SELECT * FROM servers WHERE discordID=?', [discordID]);
+            // Saved drag-and-drop order; servers without one keep their original
+            // relative order after the ordered ones (sort is stable).
+            const serverOrder = auth.getServerOrder(discordID);
+            const posOf = (id) => (id in serverOrder ? serverOrder[id] : Infinity);
+            data.sort((a, b) => {
+                const pa = posOf(a.serverID);
+                const pb = posOf(b.serverID);
+                return pa === pb ? 0 : pa < pb ? -1 : 1;
+            });
 
             for (const serverData of data) {
                 const serverID = serverData.serverID;
@@ -326,25 +301,13 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                                 server.id,
                                 discordID,
                             ]);
-                            serversDeleted++;
                             continue;
                         }
                     }
 
                     // Construct server list HTML if the member is valid
                     if (member && member.user) {
-                        const imagesCookie =
-                            urlImages !== null
-                                ? parseInt(urlImages, 10)
-                                : imagesCookieForParam !== undefined
-                                  ? parseInt(imagesCookieForParam, 10)
-                                  : 1;
-                        const serverHTML = createServerHTML(
-                            server,
-                            member,
-                            imagesCookie,
-                            sessionParam
-                        );
+                        const serverHTML = createServerHTML(server, sessionParam);
                         serverList += serverHTML;
                     }
                 } else {
@@ -353,7 +316,6 @@ exports.processServer = async function (bot, req, res, args, discordID) {
                     if (clientIsReady) {
                         // bot is connected and the guild truly isn't in cache -> safe to delete
                         auth.queryRun('DELETE FROM servers WHERE serverID=?', [serverID]);
-                        serversDeleted++;
                     } else {
                         // bot not ready / not connected: do not delete the server row; treat as temporarily missing
                         console.warn(
@@ -373,9 +335,6 @@ exports.processServer = async function (bot, req, res, args, discordID) {
             USER_ID: discordID,
             USER_NAME: escape(username),
         };
-
-        // syncNeeded already parsed via parsedUrl above
-        const syncNeeded = parsedUrl.searchParams.get('sync_needed');
 
         let serverName = '';
         if (args[2]) {
@@ -517,7 +476,7 @@ function applyUserPreferences(response, req) {
     });
 }
 
-function createServerHTML(server, member, imagesCookie, sessionParam) {
+function createServerHTML(server, sessionParam) {
     const serverName = server.name
         .replace(/<a?:[^:]+:\d+>/g, '')
         .replace(emojiRegex, '')
@@ -529,6 +488,7 @@ function createServerHTML(server, member, imagesCookie, sessionParam) {
 
     return render('server/server-icon', {
         SERVER_ICON_URL: iconUrl,
+        SERVER_ID: server.id,
         SERVER_URL: './' + server.id + (sessionParam || ''),
         SERVER_NAME: escape(normalizeWeirdUnicode(serverName)),
     });
@@ -564,105 +524,4 @@ function addUserAgentDisplay(response, req) {
         : '';
 
     return renderTemplate(response, { USER_AGENT: userAgentDisplay });
-}
-
-async function refreshDiscordServers(bot, discordID) {
-    const tokens = auth.getDiscordTokens(discordID);
-    if (!tokens || !tokens.discord_refresh_token) return;
-
-    // Only refresh if token is expired or expires in the next 5 minutes
-    const now = Math.floor(Date.now() / 1000);
-    let accessToken = tokens.discord_access_token;
-
-    const { DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URL } = require('../index');
-
-    if (!tokens.discord_token_expires || tokens.discord_token_expires < now + 300) {
-        if (!DISCORD_CLIENT_SECRET) {
-            console.error('DISCORD_CLIENT_SECRET not configured, cannot refresh token');
-            return;
-        }
-
-        try {
-            const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
-                method: 'POST',
-                body: new URLSearchParams({
-                    client_id: DISCORD_CLIENT_ID,
-                    client_secret: DISCORD_CLIENT_SECRET,
-                    grant_type: 'refresh_token',
-                    refresh_token: tokens.discord_refresh_token,
-                }),
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-            });
-            const tokenData = await tokenResponse.json();
-            if (tokenData.access_token) {
-                accessToken = tokenData.access_token;
-                auth.saveDiscordTokens(
-                    discordID,
-                    tokenData.access_token,
-                    tokenData.refresh_token,
-                    now + (tokenData.expires_in || 0)
-                );
-            } else {
-                console.warn('Failed to refresh Discord token:', tokenData);
-                return;
-            }
-        } catch (err) {
-            console.warn('Error refreshing Discord token:', err);
-            return;
-        }
-    }
-
-    if (!accessToken) return;
-
-    try {
-        const oauthClient = new SnowTransfer(`Bearer ${accessToken}`);
-        const guilds = await oauthClient.user.getGuilds();
-        const filteredServers = guilds.filter((e) => bot.client.guilds.cache.has(e.id));
-        const readyServers = filteredServers.map(function (e) {
-            return { serverID: e.id, discordID: discordID, icon: e.icon };
-        });
-        auth.insertServers(readyServers);
-
-        // Handle icons (minimal version of what's in index.js)
-        for (const server of readyServers) {
-            if (server.icon) {
-                const iconDir = path.resolve(`pages/static/ico/server`, sanitizer(server.serverID));
-                const iconPath = path.resolve(
-                    iconDir,
-                    sanitizer(
-                        `${server.icon.startsWith('a_') ? server.icon.substring(2) : server.icon}.gif`
-                    )
-                );
-
-                if (!fs.existsSync(iconPath)) {
-                    await fs.promises.mkdir(iconDir, { recursive: true });
-                    if (server.icon.startsWith('a_')) {
-                        const iconData = await (
-                            await fetch(
-                                `https://cdn.discordapp.com/icons/${server.serverID}/${server.icon}.gif?size=128`
-                            )
-                        ).arrayBuffer();
-                        await fs.promises.writeFile(iconPath, Buffer.from(iconData));
-                    } else {
-                        const iconData = await (
-                            await fetch(
-                                `https://cdn.discordapp.com/icons/${server.serverID}/${server.icon}.png?size=128`
-                            )
-                        ).arrayBuffer();
-                        await sharp(Buffer.from(iconData)).toFile(iconPath);
-                    }
-                }
-            }
-        }
-    } catch (err) {
-        if (err.message && err.message.includes('401: Unauthorized')) {
-            console.warn(
-                `Discord user token unauthorized for user ${discordID}; skipping guild refresh`
-            );
-            return;
-        }
-        console.error('Error refreshing Discord guilds:', err);
-    }
 }

@@ -1,11 +1,12 @@
 'use strict';
-const { renderTemplate, getTemplate, render } = require('./utils');
+const { getTemplate, render } = require('./utils');
+const { formatDiscordTimestamp } = require('../src/timezoneUtils');
 const md = require('markdown-it')({
     breaks: true,
     linkify: true,
     html: false,
 }).disable(['blockquote']);
-const hljs = require('highlight');
+const hljs = require('highlight.js');
 
 // Color map from highlight.js token classes to atom-one-dark hex colors.
 const HLJS_INLINE_STYLES = {
@@ -79,10 +80,6 @@ function highlightCode(code, lang) {
 function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: string } = {}) {
     if (!text) return '';
 
-    const tmpl = {
-        spoiler: getTemplate('spoiler', 'discordMarkdown'),
-    };
-
     const barColor = options.barColor || '#808080';
     const timezone = options.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
@@ -95,15 +92,20 @@ function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: st
 
     text = text.replace(/\u2018|\u2019/g, "'").replace(/\u201C|\u201D/g, '"');
 
-    text = text.replace(/\*\*\s+(.+?)\s+\*\*/g, '**$1**');
-    text = text.replace(/\*\*\s+(.+?)\*\*/g, '**$1**');
-    text = text.replace(/\*\*(.+?)\s+\*\*/g, '**$1**');
-    text = text.replace(/__\s+(.+?)\s+__/g, '__$1__');
-    text = text.replace(/__\s+(.+?)__/g, '__$1__');
-    text = text.replace(/__(.+?)\s+__/g, '__$1__');
-    text = text.replace(/\*(?!\*)\s+(.+?)\s+\*(?!\*)/g, '*$1*');
-    text = text.replace(/\*(?!\*)\s+(.+?)\*(?!\*)/g, '*$1*');
-    text = text.replace(/\*(?!\*)(.+?)\s+\*(?!\*)/g, '*$1*');
+    // Tidy stray spaces just inside emphasis markers. The captured text must not
+    // cross another marker or a newline: with a lazy `.+?` a match could run from
+    // one span into the next and swallow the space before it, so
+    // "**a**! some *b*" lost the space before *b*.
+    text = text
+        .replace(/(?<!\*)\*\*\s+([^*\n]+?)\s+\*\*/g, '**$1**')
+        .replace(/(?<!\*)\*\*\s+([^*\n]+?)\*\*/g, '**$1**')
+        .replace(/(?<!\*)\*\*([^*\n]+?)\s+\*\*/g, '**$1**')
+        .replace(/(?<!_)__\s+([^_\n]+?)\s+__/g, '__$1__')
+        .replace(/(?<!_)__\s+([^_\n]+?)__/g, '__$1__')
+        .replace(/(?<!_)__([^_\n]+?)\s+__/g, '__$1__')
+        .replace(/(?<!\*)\*(?!\*)\s+([^*\n]+?)\s+\*(?!\*)/g, '*$1*')
+        .replace(/(?<!\*)\*(?!\*)\s+([^*\n]+?)\*(?!\*)/g, '*$1*')
+        .replace(/(?<!\*)\*(?!\*)([^*\n]+?)\s+\*(?!\*)/g, '*$1*');
 
     const codePlaceholders = [];
     const underlinePlaceholders = [];
@@ -157,7 +159,7 @@ function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: st
     let inQuote = false;
     let currentQuoteList = [];
     let inMultiLineQuote = false;
-    let multiLineQuoteContent = [];
+    const multiLineQuoteContent = [];
 
     function flushAccumulators() {
         if (inList) {
@@ -229,8 +231,30 @@ function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: st
         processedLines.push(`\uE000BLOCKQUOTE${index}\uE001`);
     }
 
-    text = processedLines.join('\n');
-    let rendered = md.render(text).trim();
+    // Discord maps every newline to a line break, so a blank line between two
+    // lines of text is an empty line (and three newlines are two empty lines).
+    // Markdown would instead start a new paragraph and collapse any run of
+    // blank lines into one gap, so each blank line between ordinary text
+    // becomes a marker line that keeps the paragraph going and renders empty.
+    // Blank lines beside block elements (headers, lists, quotes, code) keep
+    // the paragraph break, whose margin already spaces them like Discord.
+    const isBlockLine = (line) =>
+        /^(?:HEADER|BULLETLIST|BLOCKQUOTE|SUBTEXT|CODEBLOCK)\d+$/.test(line.trim());
+    const nonBlank = processedLines.map((line) => line.trim() !== '');
+    const linesWithBlanks = processedLines.map((line, i) => {
+        if (nonBlank[i]) return line;
+        const prev = nonBlank.lastIndexOf(true, i);
+        const next = nonBlank.indexOf(true, i);
+        if (prev === -1 || next === -1) return line;
+        if (isBlockLine(processedLines[prev]) || isBlockLine(processedLines[next])) return line;
+        return 'BLANK';
+    });
+
+    text = linesWithBlanks.join('\n');
+    let rendered = md
+        .render(text)
+        .trim()
+        .replace(/BLANK/g, '');
 
     // Remove redundant <br> tags before and after block-level placeholders that markdown-it adds due to breaks:true
     rendered = rendered.replace(
@@ -291,7 +315,7 @@ function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: st
         const items = bulletListPlaceholders[parseInt(i, 10)];
         let html = '';
         let currentLevel = 0;
-        let stack = [];
+        const stack = [];
 
         items.forEach((item) => {
             const level = Math.floor(item.indent / 2);
@@ -348,100 +372,7 @@ function renderDiscordMarkdown(text, options: { barColor?: string; timezone?: st
     );
     final = final.replace(/\uE000TIMESTAMP(\d+)\uE001/g, (m, i) => {
         const ts = timestampPlaceholders[parseInt(i, 10)];
-        const date = new Date(ts.timestamp * 1000);
-        const now = new Date();
-        const formatTime = (dt) =>
-            dt.toLocaleString('en-US', {
-                timeZone: timezone,
-                hour: 'numeric',
-                minute: '2-digit',
-                hour12: true,
-            });
-        let formatted;
-        switch (ts.format) {
-            case 'S':
-                formatted = date.toLocaleString('en-US', {
-                    timeZone: timezone,
-                    month: '2-digit',
-                    day: '2-digit',
-                    year: '2-digit',
-                    hour: 'numeric',
-                    minute: '2-digit',
-                    second: '2-digit',
-                    hour12: true,
-                });
-                break;
-            case 'f':
-                formatted =
-                    date.toLocaleString('en-US', {
-                        timeZone: timezone,
-                        year: 'numeric',
-                        month: 'long',
-                        day: 'numeric',
-                    }) +
-                    ' at ' +
-                    formatTime(date);
-                break;
-            case 'F':
-                formatted =
-                    date.toLocaleString('en-US', {
-                        timeZone: timezone,
-                        weekday: 'long',
-                        year: 'numeric',
-                        month: 'long',
-                        day: 'numeric',
-                    }) +
-                    ' at ' +
-                    formatTime(date);
-                break;
-            case 'R':
-                const diffMs = date.getTime() - now.getTime();
-                const absSec = Math.abs(Math.round(diffMs / 1000));
-                const rel = diffMs < 0 ? 'ago' : 'in';
-                if (absSec < 60) formatted = `${absSec} seconds ${rel}`;
-                else if (absSec < 3600) formatted = `${Math.round(absSec / 60)} minutes ${rel}`;
-                else if (absSec < 86400) formatted = `${Math.round(absSec / 3600)} hours ${rel}`;
-                else formatted = `${Math.round(absSec / 86400)} days ${rel}`;
-                break;
-            case 'd':
-                formatted = date.toLocaleString('en-US', {
-                    timeZone: timezone,
-                    month: '2-digit',
-                    day: '2-digit',
-                    year: '2-digit',
-                });
-                break;
-            case 'D':
-                formatted = date.toLocaleString('en-US', {
-                    timeZone: timezone,
-                    year: 'numeric',
-                    month: 'long',
-                    day: 'numeric',
-                });
-                break;
-            case 't':
-                formatted = formatTime(date);
-                break;
-            case 'T':
-                formatted = date.toLocaleString('en-US', {
-                    timeZone: timezone,
-                    hour: 'numeric',
-                    minute: '2-digit',
-                    second: '2-digit',
-                    hour12: true,
-                });
-                break;
-            default:
-                formatted =
-                    date.toLocaleString('en-US', {
-                        timeZone: timezone,
-                        year: 'numeric',
-                        month: 'long',
-                        day: 'numeric',
-                    }) +
-                    ' at ' +
-                    formatTime(date);
-        }
+        const formatted = formatDiscordTimestamp(ts.timestamp, ts.format || 'f', timezone);
         return render('discordMarkdown/timestamp', { CONTENT: formatted });
     });
 

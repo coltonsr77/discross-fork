@@ -1,7 +1,5 @@
 'use strict';
-const discord = require('discord');
 const auth = require('../src/authentication');
-const { normalizeWeirdUnicode } = require('./unicodeUtils');
 const { convertEmoji } = require('./emojiConvert');
 const { getOrCreateWebhook } = require('./webhookCache');
 const {
@@ -15,17 +13,17 @@ const {
     buildAllowedMentions,
     canMentionEveryoneIn,
     sanitizeWebhookUsername,
-    renderTemplate,
     render,
     getTemplate,
+    canSendInChannel,
 } = require('./utils');
-const { checkAndMarkNonce } = require('./messageDedup');
+const { checkAndMarkNonce, releaseNonce } = require('./messageDedup');
 const { checkSlowMode, recordSend } = require('./slowMode');
-
-const { parseUserAgent } = require('./userAgentUtils');
 
 exports.sendMessage = async function sendMessage(bot, req, req_res, args, discordID) {
     const baseUrl = getBaseUrl(req);
+    let claimedNonce = null;
+    let delivered = false;
     try {
         // Reject cross-site initiated sends (CSRF): the Lax session cookie would
         // otherwise let a hostile page make a logged-in user post on their behalf.
@@ -55,6 +53,7 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
                 req_res.end();
                 return;
             }
+            claimedNonce = query.nonce;
 
             const channelId = query.channel || query.channel_id || args?.[2];
 
@@ -90,10 +89,7 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
                 return null;
             });
 
-            if (
-                !member ||
-                !member.permissionsIn(channel).has(discord.PermissionFlagsBits.SendMessages)
-            ) {
+            if (!(await canSendInChannel(member, channel, discordID))) {
                 req_res.writeHead(403, { 'Content-Type': 'text/html' });
                 req_res.end(
                     render('misc/error-text', {
@@ -193,6 +189,7 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
             }
 
             const message = await webhook.send(sendOptions);
+            delivered = true;
             recordSend(channel, discordID);
 
             if (userAgentStr && message && message.id) {
@@ -213,12 +210,20 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
             Location: `${baseUrl}/channels/${redirectChannel}${sessionPart}#end`,
         });
         req_res.end();
-    } catch (err) {
+    } catch (err: any) {
         if (
             err.code === 50006 ||
             (err.message && err.message.includes('Cannot send an empty message'))
         ) {
             console.warn('Attempted to send empty message:', err.message);
+        } else if (
+            err.name === 'AbortError' ||
+            (err.message && err.message.includes('This operation was aborted'))
+        ) {
+            console.warn(
+                'Message send request aborted (client cancelled or timed out):',
+                err.message
+            );
         } else {
             console.error('Error sending message:', err);
         }
@@ -229,5 +234,10 @@ exports.sendMessage = async function sendMessage(bot, req, req_res, args, discor
                 err.message || 'Unknown error occurred while sending message.'
             )
         );
+    } finally {
+        // Nothing was posted: free the nonce so the user's retry isn't dropped as a duplicate.
+        if (claimedNonce && !delivered) {
+            releaseNonce(claimedNonce);
+        }
     }
 };

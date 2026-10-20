@@ -5,6 +5,7 @@ const {
     getPageThemeAttr,
     loadAndRenderPageTemplate,
     getTemplate,
+    pageMeta,
 } = require('./utils');
 const escape = require('escape-html');
 const auth = require('../src/authentication');
@@ -12,24 +13,6 @@ const auth = require('../src/authentication');
 const setup2fa_template = loadAndRenderPageTemplate('setup-2fa', 'auth');
 const disable2fa_template = loadAndRenderPageTemplate('disable-2fa', 'auth');
 const backup_codes_template = loadAndRenderPageTemplate('backup-codes', 'auth');
-const error_template = getTemplate('error', 'login');
-const logged_in_template = getTemplate('logged-in', 'index');
-
-function injectMenuAndError(response, username, parsedUrl, sessionParam) {
-    const menuOptions = render('index/logged-in', { USER: escape(username || '') });
-    const errorText = parsedUrl.searchParams.get('errortext');
-    const errorHtml = errorText
-        ? render('login/error', {
-              ERROR_MESSAGE: escape(errorText).replaceAll('\n', getTemplate('br', 'misc')),
-          })
-        : '';
-
-    return renderTemplate(response, {
-        MENU_OPTIONS: menuOptions,
-        SESSION_PARAM: sessionParam,
-        ERROR: errorHtml,
-    });
-}
 
 exports.processSetup2FA = async function (bot, req, res, args) {
     const discordID = await auth.checkAuth(req, res, false);
@@ -97,6 +80,14 @@ exports.processSetup2FA = async function (bot, req, res, args) {
         SEND_CODE_URL: sendCodeUrl,
         ERROR: errorHtml,
         WHITE_THEME_ENABLED: getPageThemeAttr(req),
+        ...pageMeta(
+            req,
+            totpEnabled
+                ? 'Disable Two-Factor Authentication - Discross'
+                : 'Set Up Two-Factor Authentication - Discross',
+            'Manage two-factor authentication for your Discross account.',
+            { noindex: true }
+        ),
     });
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(response);
@@ -158,6 +149,9 @@ exports.handleSetup2FA = async function (bot, req, res, body, discordID) {
         MENU_OPTIONS: menuOptions,
         BACKUP_CODES_LIST: codesHtml,
         WHITE_THEME_ENABLED: getPageThemeAttr(req),
+        ...pageMeta(req, 'Backup Codes - Discross', 'Save your Discross two-factor backup codes.', {
+            noindex: true,
+        }),
     });
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(response);

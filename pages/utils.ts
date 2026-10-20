@@ -33,20 +33,48 @@ const CSS_VERSION = (function () {
  * server-side fixes are deployed, making all JS changes invisible to the device.
  */
 function getDrawJsVersion() {
-    try {
-        return String(Math.trunc(fs.statSync('pages/static/js/draw.js').mtimeMs));
-    } catch (err) {
-        return String(Date.now());
-    }
+    return getFileVersion('pages/static/js/draw.js');
 }
 
 function getChannelJsVersion() {
-    try {
-        return String(Math.trunc(fs.statSync('pages/static/js/channel.js').mtimeMs));
-    } catch (err) {
-        return String(Date.now());
+    return getFileVersion('pages/static/js/channel.js');
+}
+
+// mtime tokens and processed templates, kept in memory so rendering a page
+// doesn't hit the disk once per template. Both are dropped whenever anything
+// under pages/templates or pages/static/js changes (see watchTemplateFiles).
+const fileVersionCache = new Map();
+const templateCache = new Map();
+
+function getFileVersion(filePath) {
+    let version = fileVersionCache.get(filePath);
+    if (version === undefined) {
+        try {
+            version = String(Math.trunc(fs.statSync(filePath).mtimeMs));
+        } catch (err) {
+            version = String(Date.now());
+        }
+        fileVersionCache.set(filePath, version);
+    }
+    return version;
+}
+
+function clearTemplateCache() {
+    templateCache.clear();
+    fileVersionCache.clear();
+}
+
+function watchTemplateFiles() {
+    for (const dir of ['pages/templates', 'pages/static/js']) {
+        try {
+            fs.watch(dir, { recursive: true, persistent: false }, clearTemplateCache);
+        } catch (err) {
+            console.error(`Failed to watch ${dir} for template changes:`, err);
+        }
     }
 }
+
+watchTemplateFiles();
 
 /**
  * Loads a component template from the pages/templates folder.
@@ -58,12 +86,15 @@ function getChannelJsVersion() {
 function getTemplate(name, folder = 'channel') {
     const folderPath = folder ? `${folder}/` : '';
     const filePath = `pages/templates/${folderPath}${name}.html`;
+    const cached = templateCache.get(filePath);
+    if (cached !== undefined) return cached;
     try {
         let content = fs.readFileSync(filePath, 'utf-8');
         // Cache-bust the stylesheet so legacy browsers re-fetch it when it changes.
         content = content.replace('/css/main.css', `/css/main.css?v=${CSS_VERSION}`);
         content = content.replace('/js/draw.js"', `/js/draw.js?v=${getDrawJsVersion()}"`);
         content = content.replace('/js/channel.js"', `/js/channel.js?v=${getChannelJsVersion()}"`);
+        templateCache.set(filePath, content);
         return content;
     } catch (err) {
         console.error(`Failed to load template ${filePath}:`, err);
@@ -85,6 +116,34 @@ function loadAndRenderPageTemplate(name, folder = '', data = {}) {
 }
 
 /**
+ * Escapes page-title text for <title>. The unfilled {$PAGE_TITLE} placeholder
+ * survives untouched so templates can be rendered in two passes.
+ *
+ * @param {string} text - Plain-text title.
+ * @returns {string}
+ */
+function titleText(text) {
+    return escapeHtml(String(text));
+}
+
+/**
+ * Stops text from being treated as a template placeholder.
+ *
+ * renderTemplate resolves placeholders by plain text search, in order, over the
+ * whole page, so Discord-controlled text containing a literal "{$SESSION_ID}"
+ * (a message, an embed's url, a username) would be swapped for the viewer's real
+ * session ID by the page-level render, and a link built from it would leak the
+ * session. Apply this to HTML built from outside text before a page template
+ * receives it. The entity renders as the same character in the browser.
+ *
+ * @param {string} html - HTML (or text) that may contain "{$".
+ * @returns {string}
+ */
+function neutralizePlaceholders(html) {
+    return String(html ?? '').replace(/\{\$/g, '{&#36;');
+}
+
+/**
  * Replaces multiple template placeholders in a string.
  *
  * @param {string} template - The template string with {$PLACEHOLDER} tags.
@@ -95,8 +154,6 @@ function renderTemplate(template, data) {
     if (!template) return '';
     if (!data) data = {};
 
-    const isCachingPass = Object.keys(data).length === 0;
-
     // Global template variables
     const globalData = {
         DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
@@ -104,15 +161,18 @@ function renderTemplate(template, data) {
         DISCORD_REDIRECT_URL_ENCODED: encodeURIComponent(
             (process.env.DISCORD_REDIRECT_URL || '').trim()
         ),
-        PAGE_TITLE:
-            data.PAGE_TITLE ??
-            (isCachingPass ? '{$PAGE_TITLE}' : 'Discross - Use Discord Anywhere'),
-        SEO_METADATA: data.SEO_METADATA ?? (isCachingPass ? '{$SEO_METADATA}' : ''),
+        // Without a title, leave the placeholder so a later pass (or the response
+        // wrapper in index.ts) supplies it; filling a default here would bake it
+        // in before the page knows its real name.
+        PAGE_TITLE: titleText(data.PAGE_TITLE ?? '{$PAGE_TITLE}'),
+        SEO_METADATA: data.SEO_METADATA ?? '{$SEO_METADATA}',
         COMMON_HEAD: getTemplate('head', 'partials'),
     };
 
-    // Merge global data with provided data (provided data takes precedence)
-    const mergedData = { ...globalData, ...data };
+    // Merge global data with provided data (provided data takes precedence), but
+    // never let the raw title overwrite the escaped one: it lands in <title>, and
+    // callers pass plain text that can include server names and query strings.
+    const mergedData = { ...globalData, ...data, PAGE_TITLE: globalData.PAGE_TITLE };
 
     let result = template;
     for (const [key, value] of Object.entries(mergedData)) {
@@ -122,22 +182,16 @@ function renderTemplate(template, data) {
             normalizedKey = normalizedKey.slice(2, -1);
         }
         const placeholder = `{$${normalizedKey}}`;
+        if (!result.includes(placeholder)) continue;
         result = result.split(placeholder).join(value ?? '');
     }
 
     // Secondary pass for global templates that might have injected more placeholders
-    if (result.includes('{$PAGE_TITLE}')) {
-        result = result
-            .split('{$PAGE_TITLE}')
-            .join(
-                data.PAGE_TITLE ??
-                    (isCachingPass ? '{$PAGE_TITLE}' : 'Discross - Use Discord Anywhere')
-            );
+    if (result.includes('{$PAGE_TITLE}') && data.PAGE_TITLE !== undefined) {
+        result = result.split('{$PAGE_TITLE}').join(globalData.PAGE_TITLE);
     }
-    if (result.includes('{$SEO_METADATA}')) {
-        result = result
-            .split('{$SEO_METADATA}')
-            .join(data.SEO_METADATA ?? (isCachingPass ? '{$SEO_METADATA}' : ''));
+    if (result.includes('{$SEO_METADATA}') && data.SEO_METADATA !== undefined) {
+        result = result.split('{$SEO_METADATA}').join(data.SEO_METADATA);
     }
 
     return result;
@@ -175,6 +229,26 @@ function isBotReady(bot) {
  * @param {object} req - Node.js IncomingMessage.
  * @returns {string}
  */
+/**
+ * Reduces a URL (absolute, relative or a Referer) to a path on this site.
+ *
+ * Only the path, query and hash are kept, and leading slashes/backslashes are
+ * collapsed so the result can never be a protocol-relative `//evil.example`
+ * that browsers would treat as an off-site redirect.
+ *
+ * @param {string} target - URL or path supplied by the client.
+ * @param {string} [fallback='/'] - Returned when the target can't be parsed.
+ * @returns {string}
+ */
+function toLocalPath(target, fallback = '/') {
+    try {
+        const url = new URL(String(target ?? ''), 'http://localhost');
+        return '/' + url.pathname.replace(/^[/\\]+/, '') + url.search + url.hash;
+    } catch {
+        return fallback;
+    }
+}
+
 function getBaseUrl(req) {
     const scheme = req.socket && req.socket.encrypted ? 'https' : 'http';
     const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
@@ -255,9 +329,33 @@ function generateSEOMetadata(
         Object.assign(jsonLd, options.schemaExtra);
     }
 
-    html += `\n    <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>`;
+    // The page's own query string (e.g. a weather city) reaches this JSON, so keep
+    // '</script>' and HTML comments from ending the block early.
+    const jsonLdText = JSON.stringify(jsonLd)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+    html += `\n    <script type="application/ld+json">${jsonLdText}</script>`;
 
     return html;
+}
+
+/**
+ * The title and SEO tags a page passes to renderTemplate.
+ *
+ * @param {object} req - Node.js IncomingMessage.
+ * @param {string} title - Plain-text page title.
+ * @param {string} description - Plain-text description.
+ * @param {object} [extra] - Extra generateSEOMetadata options (e.g. { noindex: true }).
+ * @returns {{PAGE_TITLE: string, SEO_METADATA: string}}
+ */
+function pageMeta(req, title, description, extra = {}) {
+    return {
+        PAGE_TITLE: title,
+        SEO_METADATA: generateSEOMetadata(req, { title, description, ...extra }),
+    };
 }
 
 function escapeHtml(text) {
@@ -391,7 +489,6 @@ function resolveTheme(req) {
  * @param {string|null} urlImages - Images preference from URL params (null if absent).
  * @param {string|undefined} cookieImages - images cookie value (undefined if absent).
  * @param {string|null} urlSkinTone - Skin tone preference from URL params (null if absent).
- * @param {string|undefined} cookieSkinTone - emojiSkinTone cookie value (undefined if absent).
  * @returns {string} Query string (e.g. "?sessionID=abc&theme=1") or empty string.
  */
 function buildSessionParam(
@@ -400,8 +497,7 @@ function buildSessionParam(
     cookieTheme,
     urlImages,
     cookieImages,
-    urlSkinTone = null,
-    cookieSkinTone = undefined
+    urlSkinTone = null
 ) {
     const parts = [];
     if (urlSessionID) parts.push('sessionID=' + encodeURIComponent(urlSessionID));
@@ -440,7 +536,6 @@ function buildEmojiToggleUrl(baseUrl, emojiOpen, sessionParam) {
  * @returns {string} URL with `expanded=1` added (to expand) or removed (to collapse).
  */
 function buildEmojiExpandUrl(baseUrl, expanded, sessionParam) {
-    const separator = sessionParam ? '&' : '?';
     const base = baseUrl + (sessionParam || '');
 
     // Ensure emoji=1 is present
@@ -549,7 +644,7 @@ async function resolveMentions(text, guild) {
  * @returns {boolean} True if the member may ping everyone/here and any role.
  */
 function canMentionEveryoneIn(member, channel) {
-    const { PermissionFlagsBits } = require('discord');
+    const { PermissionFlagsBits } = require('discord.js');
     try {
         return member.permissionsIn(channel).has(PermissionFlagsBits.MentionEveryone);
     } catch (err) {
@@ -772,8 +867,8 @@ function httpsGet(options, maxRedirects) {
  * @param {import('discord.js').BaseGuildTextChannel|import('discord.js').AnyThreadChannel} chnl - The channel.
  * @returns {Promise<boolean>} True if viewable, false otherwise.
  */
-async function canViewChannel(member, botMember, chnl, discordID) {
-    const { PermissionFlagsBits, ChannelType } = require('discord');
+async function canViewChannel(member, botMember, chnl, discordID, { skipAgeGate = false } = {}) {
+    const { PermissionFlagsBits, ChannelType } = require('discord.js');
 
     if (!botMember || !chnl) return false;
 
@@ -789,19 +884,15 @@ async function canViewChannel(member, botMember, chnl, discordID) {
         return false;
     }
 
-    // NSFW channels require the viewer's Discord account to be age-verified
-    // the same way Discord's own clients gate them. Discross can't run
-    // Discord's verification flow itself, so anyone we can't confirm this
-    // for — including guests, who have no Discord account at all — is denied.
-    const { isNsfwChannel } = require('./nsfwUtils');
-    if (isNsfwChannel(chnl)) {
-        if (!discordID) return false;
-        const { isAgeVerified } = require('./ageVerification');
-        if (!(await isAgeVerified(discordID))) return false;
-    }
+    // Age-restricted channels need a confirmed adult; anonymous guests never qualify.
+    // Page routes pass skipAgeGate so they can run the 18+ prompt themselves.
+    const { isNsfwBlocked } = require('./nsfwUtils');
+    if (!skipAgeGate && isNsfwBlocked(chnl, discordID)) return false;
 
-    // Thread membership check: if member is provided, they must be a member to view
-    if (chnl.isThread() && member) {
+    // Public threads are readable by anyone who can see the parent channel; private
+    // threads need membership (or Manage Threads, as in Discord).
+    if (chnl.isThread() && member && chnl.type === ChannelType.PrivateThread) {
+        if (member.permissionsIn(chnl).has(PermissionFlagsBits.ManageThreads, true)) return true;
         try {
             await chnl.members.fetch(member.id);
             return true;
@@ -813,8 +904,28 @@ async function canViewChannel(member, botMember, chnl, discordID) {
     return true;
 }
 
-function reportError(message, error) {
-    console.error(message, error);
+/**
+ * Whether a member may post in a channel through Discross.
+ *
+ * discord.js doesn't apply Discord's implicit rule that a member who can't view
+ * a channel can't send in it either, and private channels usually only deny
+ * View Channel. So this checks the right send permission *and* the full view
+ * check, which every send path must pass.
+ *
+ * @param {import('discord.js').GuildMember} member
+ * @param {import('discord.js').GuildTextBasedChannel} chnl
+ * @param {string} discordID
+ * @returns {Promise<boolean>}
+ */
+async function canSendInChannel(member, chnl, discordID) {
+    const { PermissionFlagsBits } = require('discord.js');
+    if (!member || !chnl || !chnl.guild) return false;
+    const sendPermission =
+        typeof chnl.isThread === 'function' && chnl.isThread()
+            ? PermissionFlagsBits.SendMessagesInThreads
+            : PermissionFlagsBits.SendMessages;
+    if (!member.permissionsIn(chnl).has(sendPermission)) return false;
+    return canViewChannel(member, chnl.guild.members.me, chnl, discordID);
 }
 
 /**
@@ -860,19 +971,15 @@ function render(path, data = {}) {
  * Kept deliberately narrow to preserve legacy-console support:
  *  - Legacy clients don't send `Sec-Fetch-Site` at all → allowed (can't tell).
  *  - `same-origin` / `same-site` / `none` (typed URL, bookmark) → allowed.
- *  - Requests authenticated by an explicit `?sessionID=` in the URL are a bearer
- *    credential the attacker doesn't possess, not an ambient cookie, so they are
- *    not a CSRF vector and are allowed regardless.
+ *
+ * A `?sessionID=` in the URL is NOT an exemption. checkAuth prefers the cookie,
+ * so an attacker can add any sessionID value to a cross-site link and the
+ * victim's cookie still authenticates the request.
  *
  * @param {object} req - Node.js IncomingMessage.
  * @returns {boolean} True if the request should be rejected as cross-site.
  */
 function isCrossSiteRequest(req) {
-    try {
-        if (new URL(req.url, 'http://localhost').searchParams.get('sessionID')) return false;
-    } catch (e) {
-        // fall through — treat as no URL session
-    }
     const site = req.headers && req.headers['sec-fetch-site'];
     return site === 'cross-site';
 }
@@ -880,13 +987,16 @@ function isCrossSiteRequest(req) {
 module.exports = {
     getTemplate,
     renderTemplate,
+    neutralizePlaceholders,
     isCrossSiteRequest,
     render,
     loadAndRenderPageTemplate,
     generateSEOMetadata,
+    pageMeta,
     isValidSnowflake,
     isBotReady,
     getBaseUrl,
+    toLocalPath,
     parseCookies,
     getPageThemeAttr,
     resolveTheme,
@@ -906,6 +1016,6 @@ module.exports = {
     httpsGet,
     formatChangePct,
     changeColor,
-    reportError,
     canViewChannel,
+    canSendInChannel,
 };

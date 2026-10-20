@@ -29,6 +29,7 @@
           <td>&nbsp;&nbsp;&nbsp;&nbsp;</td>
           <td>
             <form action="/login" method="post">
+              <input type="hidden" name="redirect" id="login-redirect" value="{$REDIRECT_URL}" />
               <h1 style="font-size: 24px; font-weight: bold; font-family: 'rodin', Arial, Helvetica, sans-serif; color: #dddddd; margin: 0 0 8px 0;">Login</h1><br />
               {$ERROR}<br />
               <font face="'rodin', Arial, Helvetica, sans-serif" color="#dddddd">
@@ -54,7 +55,7 @@
                 <!-- Shown only once we know the browser can do WebAuthn: conditional
                      autofill is not offered by every browser, and without this there
                      is no way to start a passkey login at all. -->
-                <button type="button" id="passkey-login" class="discross-button secondary" style="display: none; color: #ffffff; height: 44px; width: 200px; margin: 12px 0 0 0; border: none; background: #4f545c; border-radius: 8px; font-family: 'rodin', Arial, Helvetica, sans-serif; font-size: 16px; font-weight: 500; cursor: pointer; text-align: center; box-sizing: border-box; white-space: nowrap;">Sign in with a passkey</button>
+                <button type="button" id="passkey-login" class="discross-button secondary" style="display: none; color: #ffffff; height: 44px; min-width: 200px; padding: 0 20px; margin: 12px 0 0 0; border: none; background: #4f545c; border-radius: 8px; font-family: 'rodin', Arial, Helvetica, sans-serif; font-size: 16px; font-weight: 500; cursor: pointer; text-align: center; box-sizing: border-box; white-space: nowrap;">Sign in with a passkey</button>
                 </td>
                 </tr>
                 </table>
@@ -106,7 +107,11 @@
 
                             var result = await verify.json();
                             if (verify.ok && result.success) {
-                                window.location.href = '/server/?sessionID=' + encodeURIComponent(result.sessionID) + '#end';
+                                var redirectField = document.getElementById('login-redirect');
+                                var target = (redirectField && redirectField.value) || '/server/';
+                                if (target.charAt(0) !== '/' || target.charAt(1) === '/') target = '/server/';
+                                target = target.split('#')[0];
+                                window.location.href = target + (target.indexOf('?') === -1 ? '?' : '&') + 'sessionID=' + encodeURIComponent(result.sessionID) + '#end';
                             } else {
                                 if (!isConditional) alert('Passkey login failed: ' + (result.error || 'Unknown error'));
                             }

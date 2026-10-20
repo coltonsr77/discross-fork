@@ -18,25 +18,27 @@
         "highlight.js": "^11.11.1",
         "https-proxy-agent": "^9.1.0",
         "ioredis": "^5.11.1",
-        "markdown-it": "^14.1.0",
+        "markdown-it": "^14.3.3",
         "mime-types": "^3.0.1",
         "otplib": "^13.3.0",
         "path-sanitizer": "^3.1.0",
         "qrcode": "^1.5.4",
         "resend": "^6.12.3",
-        "sharp": "^0.35.0",
+        "sharp": "^0.35.5",
         "snowtransfer": "^0.15.0",
         "turndown": "^7.2.4",
         "ua-parser-js": "^2.0.8",
-        "undici": "^6.27.0",
+        "undici": "^6.29.1",
         "uuid": "^13.0.0",
         "ws": "^8.17.0"
     },
     "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1",
         "start": "tsx index.ts",
-        "format": "prettier --write \"**/*.{ts,css,html,json}\"",
-        "format:check": "prettier --check \"**/*.{ts,css,html,json}\""
+        "lint": "eslint .",
+        "typecheck": "tsc --noEmit -p .",
+        "format": "prettier --write \"**/*.{ts,js,mjs,css,html,json}\"",
+        "format:check": "prettier --check \"**/*.{ts,js,mjs,css,html,json}\"",
+        "check": "npm run typecheck && npm run lint && npm run format:check"
     },
     "overrides": {
         "undici": "$undici"
@@ -52,6 +54,7 @@
     },
     "homepage": "http://discross.net/",
     "devDependencies": {
+        "@eslint/js": "^10.0.1",
         "@types/async-lock": "^1.4.2",
         "@types/bcrypt": "^6.0.0",
         "@types/better-sqlite3": "^7.6.13",
@@ -65,8 +68,11 @@
         "@types/ua-parser-js": "^0.7.39",
         "@types/uuid": "^10.0.0",
         "@types/ws": "^8.18.1",
+        "eslint": "^10.12.0",
+        "globals": "^17.13.0",
         "prettier": "^3.8.1",
         "tsx": "^4.22.4",
-        "typescript": "^6.0.3"
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.71.2"
     }
 }

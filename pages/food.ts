@@ -9,12 +9,10 @@ const { getTimezoneFromIP, formatDateWithTimezone } = require('../src/timezoneUt
 const {
     renderTemplate,
     getPageThemeAttr,
-    parseCookies,
     loadAndRenderPageTemplate,
     getTemplate,
     generateSEOMetadata,
 } = require('./utils');
-const AsyncLock = require('async-lock');
 
 const API_TIMEOUT_MS = 15000;
 const VERIFICATION_CODE_MIN = 100000;
@@ -31,7 +29,7 @@ function strReplace(string, needle, replacement) {
 /**
  * Apply common template fields like session ID, cart count, and theme.
  */
-function applyCommonFields(html, req, templates, theme, sessionData) {
+function applyCommonFields(html, req, theme, sessionData) {
     const { persistentParam, persistentSuffix, urlSessionID } = sessionData;
 
     html = strReplace(html, '{$SESSION_PARAM}', persistentParam);
@@ -423,7 +421,7 @@ exports.handleGet = async function (bot, req, res, discordID) {
             seoOptions.description ||
             "Order pizza from Domino's through Discross, the universal Discord client.";
 
-        let result = applyCommonFields(html, req, templates, theme, sessionData);
+        let result = applyCommonFields(html, req, theme, sessionData);
         result = renderTemplate(result, {
             PAGE_TITLE: pageTitle,
             SEO_METADATA: generateSEOMetadata(req, {
@@ -834,7 +832,7 @@ exports.handleGet = async function (bot, req, res, discordID) {
 
     // --- Tracker page ---
     if (subpath === 'track') {
-        let html = common(templates.track);
+        const html = common(templates.track);
         const lastOrder = auth.querySingle(
             'SELECT store_name, timestamp FROM pizza_orders WHERE discordID=? ORDER BY timestamp DESC LIMIT 1',
             [discordID]
@@ -1728,7 +1726,7 @@ exports.foodProxy = async function (req, res) {
     const parsedurl = new URL(req.url, 'http://localhost');
     const imagePath = parsedurl.pathname
         .replace(/^\/foodProxy\//, '')
-        .replace(/[^a-zA-Z0-9_.\-]/g, '');
+        .replace(/[^a-zA-Z0-9_.-]/g, '');
 
     if (!imagePath) {
         res.writeHead(404);

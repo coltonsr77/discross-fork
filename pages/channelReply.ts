@@ -1,8 +1,8 @@
 'use strict';
 const escape = require('escape-html');
-const { PermissionFlagsBits } = require('discord');
+const { PermissionFlagsBits } = require('discord.js');
 const { getDisplayName } = require('./memberUtils');
-const { getClientIP, getTimezoneFromIP, formatDateWithTimezone } = require('../src/timezoneUtils');
+const { getTimezoneFromIP } = require('../src/timezoneUtils');
 const {
     buildMessagesHtml,
     flattenPreviewMarkup,
@@ -17,8 +17,6 @@ const {
     processUnicodeEmojiInText,
 } = require('./emojiUtils');
 const notFound = require('./notFound');
-const { isNsfwChannel } = require('./nsfwUtils');
-const { isAgeVerified } = require('./ageVerification');
 
 function formatAuthorName(name) {
     if (!name) return '';
@@ -53,7 +51,7 @@ const message_forwarded_mentioned_template = getTemplate(
 // Shared templates (same as channel.js)
 const first_message_content_template = getTemplate('first-message-content', 'message');
 const merged_message_content_template = getTemplate('merged-message-content', 'message');
-const mention_template = getTemplate('mention', 'message');
+const mention_template = getTemplate('mention', 'message').trim();
 const input_template = getTemplate('input', 'channel');
 const input_disabled_template = getTemplate('input-disabled', 'channel');
 const no_message_history_template = getTemplate('no-message-history', 'channel');
@@ -126,8 +124,7 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
         whiteThemeCookie,
         urlImages,
         imagesCookieValue,
-        querySkinTone,
-        cookieSkinTone
+        querySkinTone
     );
 
     const themeObj = resolveTheme(req);
@@ -170,27 +167,22 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
                 return;
             }
 
-            if (isNsfwChannel(chnl) && !(await isAgeVerified(discordID))) {
-                res.writeHead(403, { 'Content-Type': 'text/html' });
-                res.end(
-                    render('misc/nsfw-gate', {
-                        STATE: encodeURIComponent('return:' + req.url),
-                    })
-                );
-                return;
-            }
-
             const canView = await require('./utils').canViewChannel(
                 member,
                 botMember,
                 chnl,
-                discordID
+                discordID,
+                { skipAgeGate: true }
             );
             if (!canView) {
                 res.writeHead(403, { 'Content-Type': 'text/html' });
                 res.end(getTemplate('no-permission', 'misc'));
                 return;
             }
+
+            // Checked after the view test so the gate never names a channel the caller
+            // can't open.
+            if (require('./nsfwUtils').sendAgeGateIfNeeded(req, res, chnl, discordID)) return;
 
             // Fetch server emojis
             let serverEmojis = [];
@@ -202,7 +194,8 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
                     animated: e.animated,
                     url: e.imageURL(),
                 }));
-                serverEmojisJSON = JSON.stringify(serverEmojis);
+                // Lands inside an inline <script>, so keep '</script>' from closing it.
+                serverEmojisJSON = JSON.stringify(serverEmojis).replace(/</g, '\\u003c');
             }
 
             const channelDisplayName =
@@ -258,7 +251,7 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
                         : input_disabled_template,
                     COLOR: boxColor,
                     MESSAGES: no_message_history_template,
-                    SESSION_ID: urlSessionID,
+                    SESSION_ID: escape(urlSessionID),
                     SESSION_PARAM: sessionParam,
                     EMOJI_DISPLAY: emojiDisplay,
                     EMOJI_TOGGLE_URL: emojiToggleUrl,
@@ -309,7 +302,7 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
                 .has(PermissionFlagsBits.ManageWebhooks, true);
             const canSend = member.permissionsIn(chnl).has(PermissionFlagsBits.SendMessages, true);
             const inputTpl = noWebhooks || !canSend ? input_disabled_template : input_template;
-            let templateWithInput = renderTemplate(template, {
+            const templateWithInput = renderTemplate(template, {
                 INPUT: inputTpl,
                 COLOR: boxColor,
             });
@@ -342,7 +335,7 @@ exports.processChannelReply = async function processChannelReply(bot, req, res, 
                     RANDOM_EMOJI: randomEmoji,
                     CHANNEL_NAME: normalizeWeirdUnicode(chnl.name),
                     MESSAGES: response,
-                    SESSION_ID: urlSessionID,
+                    SESSION_ID: escape(urlSessionID),
                     SESSION_PARAM: sessionParam,
                     EMOJI_DISPLAY: emojiDisplay,
                     EMOJI_TOGGLE_URL: emojiToggleUrl,

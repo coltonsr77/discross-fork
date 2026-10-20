@@ -1,6 +1,6 @@
 'use strict';
+const escape = require('escape-html');
 const fs = require('fs');
-const { PermissionFlagsBits } = require('discord');
 const { normalizeWeirdUnicode } = require('./unicodeUtils');
 const notFound = require('./notFound');
 const {
@@ -101,13 +101,18 @@ exports.processDraw = async function processDraw(bot, req, res, args, discordID)
                 member,
                 botMember,
                 chnl,
-                discordID
+                discordID,
+                { skipAgeGate: true }
             );
             if (!canView) {
                 res.writeHead(403, { 'Content-Type': 'text/html' });
                 res.end(getTemplate('draw-permission-error', 'misc'));
                 return;
             }
+
+            // Checked after the view test so the gate never names a channel the caller
+            // can't open.
+            if (require('./nsfwUtils').sendAgeGateIfNeeded(req, res, chnl, discordID)) return;
 
             const userAgentStr = req.headers['user-agent'] || '';
             const isWii =
@@ -127,7 +132,7 @@ exports.processDraw = async function processDraw(bot, req, res, args, discordID)
                 const wiiTemplate = renderTemplate(baseTemplate, {
                     CHANNEL_ID: chnl.id,
                     CHANNEL_NAME: channelName,
-                    SESSION_ID: urlSessionID,
+                    SESSION_ID: escape(urlSessionID),
                     SESSION_PARAM: sessionParam,
                     // Wii-only tokens (empty for every other client).
                     EXTRA_HEAD: WII_EXTRA_HEAD,
@@ -153,7 +158,8 @@ exports.processDraw = async function processDraw(bot, req, res, args, discordID)
                     animated: e.animated,
                     url: e.imageURL(),
                 }));
-                serverEmojisJSON = JSON.stringify(serverEmojis);
+                // Lands inside an inline <script>, so keep '</script>' from closing it.
+                serverEmojisJSON = JSON.stringify(serverEmojis).replace(/</g, '\\u003c');
             }
 
             const {
@@ -193,7 +199,7 @@ exports.processDraw = async function processDraw(bot, req, res, args, discordID)
                 SERVER_ID: chnl.guild.id,
                 CHANNEL_ID: chnl.id,
                 CHANNEL_NAME: channelName,
-                SESSION_ID: urlSessionID,
+                SESSION_ID: escape(urlSessionID),
                 SESSION_PARAM: sessionParam,
                 EMOJI_PICKER: emojiPickerHTML,
                 EMOJI_BUTTON: getTemplate('emoji-picker-button', 'partials'),

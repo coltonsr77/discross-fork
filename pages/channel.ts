@@ -1,7 +1,7 @@
 'use strict';
 
 const escape = require('escape-html');
-const { PermissionFlagsBits } = require('discord');
+const { PermissionFlagsBits } = require('discord.js');
 const notFound = require('./notFound');
 const { normalizeWeirdUnicode } = require('./unicodeUtils');
 const {
@@ -21,8 +21,7 @@ const {
 const { getTimezoneFromIP } = require('../src/timezoneUtils');
 const { isLegacyClient } = require('./userAgentUtils');
 const { buildMessagesHtml } = require('./messageRenderer');
-const { isNsfwChannel } = require('./nsfwUtils');
-const { isAgeVerified } = require('./ageVerification');
+const { sendAgeGateIfNeeded } = require('./nsfwUtils');
 
 exports.processChannel = async function processChannel(bot, req, res, args, discordID) {
     const parsedUrl = new URL(req.url, 'http://localhost');
@@ -71,8 +70,7 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
         cookieTheme,
         urlImages,
         cookieImages,
-        querySkinTone,
-        cookieSkinTone
+        querySkinTone
     );
 
     try {
@@ -92,25 +90,19 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
             return;
         }
 
-        // Age-restricted channels get a dedicated gate instead of the generic
-        // permission error so the user knows why and how to resolve it.
-        if (isNsfwChannel(chnl) && !(await isAgeVerified(discordID))) {
-            res.writeHead(403, { 'Content-Type': 'text/html' });
-            res.end(
-                render('misc/nsfw-gate', {
-                    STATE: encodeURIComponent('return:' + req.url),
-                })
-            );
-            return;
-        }
-
-        const canView = await canViewChannel(member, botMember, chnl, discordID);
+        const canView = await canViewChannel(member, botMember, chnl, discordID, {
+            skipAgeGate: true,
+        });
 
         if (!canView) {
             res.writeHead(403, { 'Content-Type': 'text/html' });
             res.end(getTemplate('no-permission', 'misc'));
             return;
         }
+
+        // Only after the view check, so the gate doesn't name a channel the
+        // caller couldn't open anyway.
+        if (sendAgeGateIfNeeded(req, res, chnl, discordID)) return;
 
         // Fetch server emojis
         let serverEmojis = [];
@@ -122,7 +114,8 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
                 animated: e.animated,
                 url: e.imageURL(),
             }));
-            serverEmojisJSON = JSON.stringify(serverEmojis);
+            // Lands inside an inline <script>, so keep '</script>' from closing it.
+            serverEmojisJSON = JSON.stringify(serverEmojis).replace(/</g, '\\u003c');
         }
 
         const {
@@ -134,6 +127,11 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
 
         const baseTemplate = render('/channel', {
             COMMON_HEAD: getTemplate('head', 'partials'),
+            // Keep the head's title and SEO placeholders for the final pass below;
+            // otherwise the defaults get baked into the head before the channel
+            // name is known.
+            PAGE_TITLE: '{$PAGE_TITLE}',
+            SEO_METADATA: '{$SEO_METADATA}',
             PAGE_CLASS: 'page-channel',
             EMOJI_PICKER: render(
                 isLegacy ? 'partials/emoji-picker-lite' : 'partials/emoji-picker',
@@ -192,7 +190,7 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
                 INPUT: inputHtml,
                 MESSAGES: getTemplate('no-message-history', 'channel'),
                 CHANNEL_NAME: escape(channelDisplayName),
-                SESSION_ID: urlSessionID,
+                SESSION_ID: escape(urlSessionID),
                 SESSION_PARAM: sessionParam,
                 EMOJI_DISPLAY: urlEmoji === '1' ? '' : 'display: none;',
                 EMOJI_TOGGLE_URL: buildEmojiToggleUrl(chnl.id, urlEmoji === '1', sessionParam),
@@ -232,7 +230,7 @@ exports.processChannel = async function processChannel(bot, req, res, args, disc
             RANDOM_EMOJI: RANDOM_EMOJIS[Math.floor(Math.random() * RANDOM_EMOJIS.length)],
             CHANNEL_NAME: escape(channelDisplayName),
             MESSAGES: messagesHtml,
-            SESSION_ID: urlSessionID,
+            SESSION_ID: escape(urlSessionID),
             SESSION_PARAM: sessionParam,
             EMOJI_DISPLAY: urlEmoji === '1' ? '' : 'display: none;',
             EMOJI_TOGGLE_URL: buildEmojiToggleUrl(chnl.id, urlEmoji === '1', sessionParam),

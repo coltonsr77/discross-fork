@@ -145,15 +145,6 @@ function coseToKeyObject(cose) {
     throw new Error('Unsupported COSE key type: ' + kty);
 }
 
-function coseAlgToHash(cose) {
-    const alg = cose.get(3);
-    // -7 ES256 / -257 RS256 → SHA-256; -35 ES384/-258 RS384 → SHA-384; etc.
-    if (alg === -7 || alg === -257) return 'sha256';
-    if (alg === -35 || alg === -258) return 'sha384';
-    if (alg === -36 || alg === -259) return 'sha512';
-    return 'sha256';
-}
-
 function normalizeB64url(s) {
     return (s || '').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
@@ -209,6 +200,10 @@ function verifyAssertion(response, expected) {
     const authDataBuf = Buffer.from(response.authenticatorData, 'base64');
     const authData = parseAuthData(authDataBuf);
     if (!authData.userPresent) throw new Error('User not present');
+    // A passkey sign-in replaces both the password and the 2FA code, so it must
+    // be backed by a PIN or biometric. The options ask for userVerification
+    // "required", but only the authenticator's own flag proves it happened.
+    if (!authData.userVerified) throw new Error('User verification required');
     assertRpIdHash(authData.rpIdHash, expected.expectedRpId);
 
     // Signed data = authenticatorData || SHA-256(clientDataJSON)

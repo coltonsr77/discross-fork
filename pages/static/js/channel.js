@@ -172,10 +172,6 @@ function showEmoji() {
         }
         setTimeout(scrollToBottom, 50);
     }
-
-    if (typeof updateToolbarPadding === 'function') {
-        updateToolbarPadding();
-    }
 }
 
 // File Selection Wrapper
@@ -242,8 +238,10 @@ function uploadFile(file) {
 // Message Sending
 // =============
 function sendMessageOrFile() {
+    // One nonce per page load: a double Enter/click re-submits the same nonce,
+    // so the server drops the duplicate instead of posting twice.
     var nonceEl = document.getElementById('nonce');
-    if (nonceEl) {
+    if (nonceEl && !nonceEl.value) {
         nonceEl.value = generateNonce();
     }
     return true;
@@ -294,19 +292,20 @@ function autoResize(el) {
 
     var currentLen = el.value.length;
     var lastLen = parseInt(el.getAttribute('data-last-len') || '0');
+    var newHeight;
     el.setAttribute('data-last-len', currentLen);
 
     // If growing, we can just use scrollHeight without resetting to auto
     if (currentLen > lastLen) {
         if (el.scrollHeight > el.offsetHeight && el.offsetHeight < 200) {
-            var newHeight = Math.min(el.scrollHeight, 200);
+            newHeight = Math.min(el.scrollHeight, 200);
             el.style.height = newHeight + 'px';
         }
     } else {
         // Shrinking or same length (potential wrap change)
         // Reset to auto to get natural height
         el.style.height = 'auto';
-        var newHeight = el.scrollHeight;
+        newHeight = el.scrollHeight;
         if (newHeight < 40) newHeight = 40;
         if (newHeight > 200) newHeight = 200;
         el.style.height = newHeight + 'px';

@@ -193,37 +193,6 @@ pre code {
 }
 
 /* ================================================================
-   4. HEADER
-   ================================================================ */
-
-.header-table {
-    width: 100%;
-}
-.header-title {
-    font-size: 2.625rem;
-    font-family: 'rodin', Arial, Helvetica, sans-serif;
-    color: #dddddd;
-}
-.header-menu {
-    width: 100%;
-    text-align: right;
-    font-size: 1.5rem;
-    font-family: 'rodin', Arial, Helvetica, sans-serif;
-    color: #dddddd;
-}
-.header-menu a,
-.header-menu-link {
-    color: #dddddd;
-    text-decoration: none;
-    font-size: 1.125rem;
-    font-family: 'rodin', Arial, Helvetica, sans-serif;
-}
-.header-user-info {
-    color: #aaaaaa;
-    font-size: 0.75rem;
-}
-
-/* ================================================================
    5. LAYOUT / CONTAINERS
    ================================================================ */
 
@@ -271,7 +240,25 @@ pre code {
 .message:hover {
     background: rgba(4, 4, 5, 0.07);
 }
-.message-author,
+.message-avatar-cell {
+    width: 40px;
+    padding-right: 12px;
+    padding-top: 2px;
+}
+/* The <colgroup> in each message template pins the avatar column. Fixed table
+   layouts (phones, 3DS) read column widths from the first row, and a reply's
+   indicator row is a single colspan=2 cell that would otherwise split the two
+   columns evenly, squeezing replies into half the width of ordinary messages. */
+.message-avatar-col {
+    width: 52px;
+}
+.author-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+}
 .message-author-font {
     font-weight: 600;
     cursor: pointer;
@@ -279,7 +266,6 @@ pre code {
     color: #ffffff;
     display: inline;
 }
-.message-date,
 .message-date-font {
     font-size: 12px;
     color: #81828a;
@@ -299,6 +285,10 @@ pre code {
     font-size: 17px;
     line-height: 24px;
     word-wrap: break-word;
+    /* "anywhere" (unlike break-word) also shrinks the min-content width, so a
+       long unbroken string wraps inside its table cell instead of stretching
+       the whole page. Older browsers ignore it and keep word-wrap above. */
+    overflow-wrap: anywhere;
     max-width: 100%;
 }
 .messagecontent p {
@@ -312,6 +302,7 @@ pre code {
 .messagecontent a {
     color: #00b0f4;
     word-wrap: break-word;
+    overflow-wrap: anywhere;
 }
 .messagecontent .message-link {
     color: inherit;
@@ -376,7 +367,7 @@ pre code {
     border-left: 4px solid #dc8d01;
     background: #30271f;
     margin-left: 0 !important;
-    padding-left: 12px;
+    padding-left: 8px !important;
 }
 .mention {
     color: #a9bbff;
@@ -393,6 +384,9 @@ pre code {
    8. EMBEDS
    ================================================================ */
 
+/* Mirrors Discord's embed: a 4px colour bar, then a padded card whose main
+   column (provider, author, title, description, fields) sits beside an
+   optional 80px thumbnail, followed by the large image and the footer. */
 .embed {
     margin-top: 8px;
     max-width: 520px;
@@ -403,15 +397,6 @@ pre code {
 }
 .video-embed {
     max-width: 432px;
-}
-.video-embed .embed-content {
-    padding: 6px 10px;
-}
-.video-embed .embed-content > div {
-    margin-top: 4px !important;
-}
-.video-embed .embed-content > div:first-child {
-    margin-bottom: 4px !important;
 }
 .embed-color-bar {
     display: table-cell;
@@ -426,44 +411,579 @@ pre code {
     border: 1px solid #474851;
     border-left: none;
     border-radius: 0 4px 4px 0;
-    padding: 8px 12px;
+    padding: 0 16px 16px 12px;
     vertical-align: top;
     width: 100%;
-    overflow-wrap: break-word;
     word-wrap: break-word;
+    overflow-wrap: anywhere;
+    color: #dbdee1;
+    font-size: 14px;
+    line-height: 1.375;
+}
+.embed-main {
+    overflow: hidden;
+    zoom: 1;
+}
+.embed-clear {
+    clear: both;
+    height: 0;
+    font-size: 0;
+    line-height: 0;
+    overflow: hidden;
+}
+.embed-provider,
+.embed-author,
+.embed-title,
+.embed-description,
+.embed-fields,
+.embed-footer {
+    margin-top: 8px;
+}
+.embed-provider {
+    font-size: 12px;
+    line-height: 16px;
+    color: #b5bac1;
+}
+.embed-author {
+    font-size: 14px;
+    line-height: 24px;
+    font-weight: 600;
+    color: #f2f3f5;
+}
+.embed-author-icon {
+    width: 24px;
+    height: 24px;
+    margin-right: 8px;
+    border-radius: 50%;
+    vertical-align: middle;
+}
+.embed-author-name {
+    vertical-align: middle;
+}
+.embed .embed-content a.embed-author-link,
+.embed .embed-content a.embed-author-link:visited {
+    color: inherit;
+    text-decoration: none;
+}
+.embed .embed-content a.embed-author-link:hover {
+    text-decoration: underline;
+}
+.embed-title {
+    font-size: 16px;
+    line-height: 22px;
+    font-weight: 600;
+    color: #f2f3f5;
+}
+.embed .embed-content a.embed-title-link,
+.embed .embed-content a.embed-title-link:visited {
+    color: #00a8fc;
+    text-decoration: none;
+}
+.embed .embed-content a.embed-title-link:hover {
+    text-decoration: underline;
+}
+.embed-description {
+    font-size: 14px;
+    line-height: 18px;
+    color: #dbdee1;
+}
+.embed-field-row {
+    table-layout: fixed;
+    margin-top: 8px;
+    padding: 0;
+}
+.embed-fields .embed-field-row:first-child {
+    margin-top: 0;
+}
+.embed-field {
+    padding-right: 8px;
+    vertical-align: top;
+}
+.embed-field-name {
+    font-size: 14px;
+    line-height: 18px;
+    font-weight: 600;
+    color: #f2f3f5;
+    margin-bottom: 2px;
+}
+.embed-field-value {
+    font-size: 14px;
+    line-height: 18px;
+    color: #dbdee1;
+}
+.embed-thumbnail {
+    float: right;
+    margin: 8px 0 0 16px;
+}
+.embed-thumbnail img {
+    display: block;
+    max-width: 80px;
+    max-height: 80px;
+    border-radius: 4px;
+}
+.embed-media {
+    margin-top: 16px;
+}
+.embed-image-link {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+}
+.embed-image {
+    display: block;
+    max-width: 100%;
+    max-height: 300px;
+    height: auto;
+    border-radius: 4px;
+}
+.video-embed .embed-image {
+    width: 400px;
+    max-height: none;
+}
+.embed-play {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 48px;
+    height: 48px;
+    margin: -24px 0 0 -24px;
+    border-radius: 50%;
+    background: #000000;
+    background: rgba(0, 0, 0, 0.6);
+    color: #ffffff;
+    font-size: 20px;
+    line-height: 48px;
+    text-align: center;
+    text-indent: 3px;
+}
+.embed-footer {
+    font-size: 12px;
+    line-height: 20px;
+    font-weight: 500;
+    color: #dbdee1;
+}
+.embed-footer-icon {
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
+    border-radius: 50%;
+    vertical-align: middle;
+}
+.embed-footer span {
+    vertical-align: middle;
+}
+.embed-footer-separator {
+    margin: 0 4px;
+}
+
+/* Message components: bot buttons and select menus (classic action rows) and
+   Components V2 layouts. Discross can't send interactions, so non-link
+   buttons and menus render as static, Discord-styled controls. */
+.components {
+    max-width: 520px;
+}
+.component-row {
+    margin-top: 4px;
+}
+.component-button,
+.messagecontent a.component-button {
+    display: inline-block;
+    margin: 4px 8px 0 0;
+    padding: 6px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 20px;
+    font-weight: 500;
+    color: #ffffff;
+    text-decoration: none;
+    white-space: nowrap;
+    vertical-align: top;
+    cursor: default;
+}
+.messagecontent a.component-button {
+    cursor: pointer;
+}
+.component-button-primary,
+.component-button-premium {
+    background: #5865f2;
+}
+.component-button-secondary {
+    background: #4e5058;
+}
+.component-button-success {
+    background: #248046;
+}
+.component-button-danger {
+    background: #da373c;
+}
+.component-disabled {
+    opacity: 0.5;
+}
+.component-link-icon {
+    margin-left: 6px;
+    font-size: 12px;
+}
+.component-select {
+    width: 100%;
+    max-width: 400px;
+    margin-top: 4px;
+    padding: 0;
+    background: #1e1f22;
+    border: 1px solid #1e1f22;
+    border-radius: 4px;
+    font-size: 14px;
+    line-height: 20px;
+    color: #dbdee1;
+}
+.component-select-text {
+    padding: 8px;
+}
+.component-select-placeholder {
+    color: #949ba4;
+}
+.component-select-caret {
+    width: 24px;
+    padding-right: 8px;
+    text-align: right;
+    color: #b5bac1;
+}
+.component-container {
+    margin-top: 8px;
+    padding: 16px;
+    background: #252529;
+    border: 1px solid #474851;
+    border-radius: 8px;
+}
+.component-container-spoiler {
+    cursor: pointer;
+}
+.component-container-spoiler .component-container-content {
+    filter: blur(16px);
+}
+.component-container-content > :first-child,
+.component-container-content > .component-text:first-child > :first-child {
+    margin-top: 0;
+}
+.component-text {
+    margin-top: 8px;
+}
+.components > .component-text:first-child {
+    margin-top: 0;
+}
+.component-section {
+    margin-top: 8px;
+    padding: 0;
+}
+.component-section-accessory {
+    width: 1%;
+    padding-left: 16px;
+    white-space: nowrap;
+}
+.component-section-accessory .component-button {
+    margin-top: 0;
+}
+.component-thumbnail {
+    width: 85px;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.component-gallery,
+.component-file {
+    margin-top: 8px;
+}
+.component-gallery .mosaic,
+.component-gallery .standard-image {
+    margin-top: 0;
+}
+.component-separator-small {
+    padding: 8px 0 0;
+}
+.component-separator-large {
+    padding: 16px 0 8px;
+}
+.component-separator-line {
+    height: 0;
+    border-top: 1px solid #3f4147;
+    margin-bottom: 0;
+}
+.component-separator-large .component-separator-line {
+    margin-bottom: 8px;
+}
+
+/* Attachment cards, styled after Discord's: a type icon chosen from the file
+   extension, the name as the download link (ellipsised) and the size below.
+   Audio cards add the player underneath. */
+.file-card {
+    width: 100%;
+    max-width: 432px;
+    margin-top: 8px;
+    padding: 0;
+    background: #252529;
+    border: 1px solid #36373d;
+    border-radius: 8px;
+    table-layout: fixed;
+    border-collapse: separate;
+}
+div.file-card {
+    padding: 16px;
+    box-sizing: border-box;
+}
+.file-card-header {
+    width: 100%;
+    table-layout: fixed;
+    padding: 0;
+}
+.file-card > tbody > tr > td,
+.file-card > tr > td {
+    padding-top: 16px;
+    padding-bottom: 16px;
+}
+/* Fixed table layouts size a column by its width alone, so the gaps around
+   the icon are image margins rather than cell padding. */
+.file-card-icon {
+    width: 54px;
+    padding-left: 0;
+    padding-right: 0;
+}
+div.file-card .file-card-icon {
+    width: 38px;
+}
+.file-card-icon img {
+    display: block;
+    width: 30px;
+    height: 40px;
+    margin: 0 8px 0 16px;
+}
+div.file-card .file-card-icon img {
+    margin-left: 0;
+}
+.file-card-info {
+    padding-right: 16px;
+    overflow: hidden;
+}
+.file-card-name {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 16px;
+    line-height: 20px;
+}
+.file-card-name font {
+    color: #00a8fc;
+}
+.file-card-link,
+.messagecontent a.file-card-link {
+    text-decoration: none;
+}
+.file-card-link:hover {
+    text-decoration: underline;
+}
+.file-card-size {
+    font-size: 12px;
+    line-height: 16px;
+}
+.file-card-player {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+}
+
+/* Polls, after Discord's card: question, how many answers may be picked,
+   one row per answer with its share of the vote as a fill bar (winners
+   outlined in green once the poll closes), and a vote count / time footer. */
+.poll {
+    max-width: 440px;
+    margin-top: 8px;
+    padding: 16px;
+    background: #252529;
+    border: 1px solid #36373d;
+    border-radius: 8px;
+}
+.poll-question {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #f2f3f5;
+}
+.poll-subtitle {
+    margin-top: 4px;
+    font-size: 14px;
+    line-height: 18px;
+    color: #b5bac1;
+}
+.poll-answers {
+    margin-top: 12px;
+}
+.poll-answer {
+    position: relative;
+    margin-bottom: 8px;
+    background: #1e1f22;
+    border: 1px solid #1e1f22;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.poll-answer-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    height: 100%;
+    background: #2e2f34;
+}
+.poll-answer-content {
+    position: relative;
+    padding: 0;
+}
+.poll-answer-text {
+    padding: 12px 8px 12px 16px;
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 500;
+    color: #dbdee1;
+    word-wrap: break-word;
+}
+.poll-answer-emoji {
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
+    vertical-align: -4px;
+}
+.poll-answer-stats {
+    padding: 12px 16px 12px 8px;
+    text-align: right;
+    white-space: nowrap;
+}
+.poll-answer-votes {
+    margin-right: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #dbdee1;
+}
+.poll-answer-percent {
+    font-size: 16px;
+    font-weight: 600;
+    color: #f2f3f5;
+}
+.poll-answer-winner {
+    border-color: #23a559;
+}
+.poll-answer-winner .poll-answer-fill {
+    background: #1d3a29;
+    background: rgba(35, 165, 89, 0.2);
+}
+.poll-footer {
+    margin-top: 8px;
+    font-size: 14px;
+    line-height: 18px;
+    color: #949ba4;
+}
+.poll-result {
+    width: 100%;
+    max-width: 432px;
+    margin-top: 8px;
+    padding: 0;
+    background: #252529;
+    border: 1px solid #36373d;
+    border-radius: 8px;
+    border-collapse: separate;
+}
+.poll-result-info {
+    padding: 12px 8px 12px 16px;
+}
+.poll-result-winner {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #f2f3f5;
+}
+.poll-result-check {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-left: 6px;
+    border-radius: 50%;
+    background: #23a559;
+    color: #ffffff;
+    font-size: 11px;
+    line-height: 16px;
+    text-align: center;
+    vertical-align: 1px;
+}
+.poll-result-detail {
+    margin-top: 2px;
+    font-size: 12px;
+    line-height: 16px;
+    color: #949ba4;
+}
+.poll-result-action {
+    width: 1%;
+    padding: 12px 16px 12px 8px;
+    white-space: nowrap;
+}
+table.poll-result a.poll-result-button,
+table.poll-result a.poll-result-button:visited {
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: 8px;
+    background: #4e5058;
+    color: #ffffff;
+    font-size: 14px;
+    line-height: 16px;
+    font-weight: 500;
+    text-decoration: none;
+}
+
+/* Stickers show at Discord's 160px. */
+.sticker-image {
+    display: block;
+    width: 160px;
+    height: 160px;
+    margin-top: 4px;
+    object-fit: contain;
+}
+
+/* Inline images are capped at Discord's 550x350 on wide screens. */
+@media screen and (min-width: 700px) {
+    .standard-image {
+        max-width: 550px;
+    }
 }
 
 /* ================================================================
    9. REACTIONS
    ================================================================ */
 
+.reactions {
+    margin-top: 4px;
+}
+/* Discord's reaction pill: a rounded chip with a 16px emoji and a bold
+   count. Super reactions get their own pill outlined in the burst colour. */
 .reaction {
     display: inline-block;
     padding: 2px 6px;
-    background: #26262b;
-    border: 1px solid #3a3d42; /* solid fallback for IE8 which doesn't support rgba() */
-    border: 1px solid rgba(79, 84, 92, 0.3);
-    border-radius: 4px;
-    margin-top: 4px;
-    margin-right: 4px;
-    margin-bottom: 4px;
+    margin: 0 4px 4px 0;
+    background: #2b2d31;
+    border: 1px solid #2b2d31;
+    border-radius: 8px;
+    line-height: 18px;
+    vertical-align: top;
+    white-space: nowrap;
 }
 .reaction img {
     width: 16px;
     height: 16px;
-    vertical-align: middle;
+    vertical-align: -3px;
 }
 .reaction-count {
-    color: #abacb2;
-    font-size: 12px;
-    margin-left: 4px;
-    font-weight: bold;
+    margin-left: 6px;
+    color: #dbdee1;
+    font-size: 14px;
+    font-weight: 600;
     font-family: 'rodin', Whitney, 'Helvetica Neue', Helvetica, Arial, sans-serif;
 }
-
-/* Reactions inside embed messages */
-.embed-reactions .reaction {
-    background: #39312a;
+.reaction-burst {
+    border-color: #5865f2;
+    background: #2f3045;
 }
 
 /* ================================================================
@@ -519,20 +1039,6 @@ pre code {
     padding-bottom: env(safe-area-inset-bottom);
     padding-bottom: calc(12px + env(safe-area-inset-bottom));
     width: 100%;
-}
-
-.icon-button {
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 4px;
-    width: 32px;
-    height: 32px;
-    border-radius: 4px;
-    display: inline-block;
-}
-.icon-button:hover {
-    background: rgba(255, 255, 255, 0.06);
 }
 
 .message-action-btn {
@@ -702,6 +1208,13 @@ textarea:focus {
     border-color: #5865f2;
 }
 
+/* Keyboard focus uses Discord's blurple instead of the browser's black box,
+   which clashed with the light theme's composer. */
+:focus-visible {
+    outline: 2px solid #5865f2;
+    outline-offset: 1px;
+}
+
 /* ================================================================
    14. BUTTONS
    ================================================================ */
@@ -731,13 +1244,25 @@ textarea:focus {
 }
 .discross-button.secondary:hover {
     background: #5d6269;
-} /* ================================================================
+}
+.pagination-container {
+    text-align: center;
+    margin: 4px 0 12px 0;
+}
+.pagination-btn {
+    display: inline-block;
+    vertical-align: middle;
+}
+/* ================================================================
    15. SERVER PAGE COMPONENTS
    ================================================================ */
 
-.server-sidebar,
 .server-main {
     vertical-align: top;
+}
+.server-main {
+    padding-top: 0px;
+    padding-top: calc(var(--server-icon-gap, 4px) + 1px);
 }
 /* Server rail avatars, and the Home logo above them. The fixed px pair is the
    legacy fallback (and matches each img's width/height attributes); the calc()
@@ -797,6 +1322,26 @@ html.page-server .amoled-theme .server-rail hr {
     font-size: 1.5rem;
     color: #dddddd;
     font-family: 'rodin', Arial, Helvetica, sans-serif;
+}
+
+/* The channel-list heading (e.g. a server's name). display:block is safe here
+   since the source is a <b><font> pair, not something a legacy engine depends
+   on staying inline. Tight margin because the first category already has its
+   own top padding (padding-top: 1.1em via .channel-list-category). The trailing
+   <br class="channel-br"> is already hidden by the .channel-br rule above in
+   @supports blocks, so legacy engines keep the natural line-break spacing. */
+.server-name-header {
+    display: block;
+    margin-bottom: 4px;
+}
+
+/* Select a Server heading — nudge up so its top edge is flush with the
+   Home logo's top edge (mirrors what .server-name-header achieves for the
+   server-name case). The value is a best-fit against the heading's natural
+   top margin in modern browsers; legacy engines ignore it and keep the
+   original block flow. */
+.server-select-text {
+    margin-top: -3px;
 }
 
 /* Warning box (used in sync_warning embedded template) */
@@ -916,20 +1461,37 @@ canvas {
 
 /* Discord styled timestamps */
 .discord-timestamp {
-    background: #2b2e59;
+    /* Discord shows <t:...> timestamps as a subtle grey pill, not a mention */
+    background: #2c2d32;
     border-radius: 3px;
     font-size: 17px;
     color: #dcddde;
-    white-space: nowrap;
 }
 
-/* Spoiler blocks */
+/* Form rows made of fixed-width inputs (TV zip/date, search) can't fit a phone;
+   on narrow screens let their cells wrap onto further lines instead. */
+@media screen and (max-width: 480px) {
+    tr.wrap-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+    }
+    tr.wrap-row > td {
+        display: block;
+        padding-left: 0 !important;
+        padding-right: 8px;
+        padding-bottom: 8px;
+    }
+}
+
+/* Spoiler blocks: a solid block until clicked, like Discord */
 .spoiler-box {
     padding-bottom: 0;
     cursor: pointer;
     border-radius: 3px;
     border-spacing: 0;
     overflow: hidden;
+    background: #45464e;
 }
 .spoiler-box.spoiler-revealed {
     background: #26262b;
@@ -945,18 +1507,9 @@ body.light-theme,
     background: #fbfbfb !important;
     color: #323339 !important;
 }
-.light-theme .content-padding,
-.light-theme .scrollable-content {
+.light-theme .content-padding {
     background: #fbfbfb;
     color: #323339;
-}
-.light-theme .header-title,
-.light-theme .header-menu,
-.light-theme .header-menu-link {
-    color: #323339;
-}
-.light-theme .header-user-info {
-    color: #4f5660;
 }
 .light-theme .message {
     border-color: #e3e5e8 !important;
@@ -971,14 +1524,8 @@ body.light-theme,
 .light-theme .message:hover {
     background: #f2f3f5 !important;
 }
-.light-theme .message-author {
-    color: #323339;
-}
 .light-theme .message-author-font {
     color: #323339 !important;
-}
-.light-theme .message-date {
-    color: #70718a;
 }
 .light-theme .message-date-font {
     color: #70718a !important;
@@ -998,8 +1545,8 @@ body.light-theme,
     background: #fbfbfb !important;
     border-top-color: #e3e5e8 !important;
 }
-.light-theme .icon-button:hover {
-    background: rgba(0, 0, 0, 0.08);
+.light-theme .message-input-bar-wrapper {
+    background: #ebedef !important;
 }
 .light-theme .message-action-btn {
     background: #fbfbfb !important;
@@ -1017,9 +1564,83 @@ body.light-theme,
     background: transparent !important;
     border: none !important;
 }
+.light-theme .discord-quote {
+    color: #4e5058;
+}
 .light-theme .embed-content {
     background: #ffffff;
     border-color: #e3e5e8;
+    color: #313338;
+}
+.light-theme .embed-color-bar {
+    background-color: #e3e5e8;
+}
+.light-theme .poll,
+.light-theme .poll-result {
+    background: #f9f9fa;
+    border-color: #e3e5e8;
+}
+.light-theme .poll-question,
+.light-theme .poll-answer-percent,
+.light-theme .poll-result-winner {
+    color: #060607;
+}
+.light-theme .poll-subtitle,
+.light-theme .poll-footer,
+.light-theme .poll-result-detail {
+    color: #5c5e66;
+}
+.light-theme .poll-answer {
+    background: #ebebed;
+    border-color: #ebebed;
+}
+.light-theme .poll-answer-fill {
+    background: #dcdde0;
+}
+.light-theme .poll-answer-winner {
+    border-color: #23a559;
+}
+.light-theme .poll-answer-winner .poll-answer-fill {
+    background: #c8ebd5;
+}
+.light-theme .poll-answer-text,
+.light-theme .poll-answer-votes {
+    color: #313338;
+}
+.light-theme table.poll-result a.poll-result-button {
+    background: #6d6f78;
+}
+.light-theme .component-container {
+    background: #ffffff;
+    border-color: #e3e5e8;
+}
+.light-theme .component-button-secondary {
+    background: #6d6f78;
+}
+.light-theme .component-select {
+    background: #ebebed;
+    border-color: #e3e5e8;
+    color: #313338;
+}
+.light-theme .component-separator-line {
+    border-top-color: #e3e5e8;
+}
+.light-theme .embed-provider {
+    color: #4e5058;
+}
+.light-theme .embed-author,
+.light-theme .embed-title,
+.light-theme .embed-field-name {
+    color: #060607;
+}
+.light-theme .embed-description,
+.light-theme .embed-field-value,
+.light-theme .embed-footer {
+    color: #313338;
+}
+.light-theme .embed .embed-content a.embed-title-link,
+.light-theme .embed .embed-content a.embed-title-link:visited {
+    color: #006ce7;
 }
 .light-theme .forwarded-block-cell {
     border-left-color: #c4c9ce;
@@ -1044,15 +1665,15 @@ body.light-theme,
     background: rgba(0, 0, 0, 0.08);
 }
 .light-theme .reaction {
-    background: #efeff0;
-    border-color: #ccc;
-    border-color: rgba(79, 84, 92, 0.15);
+    background: #ebebed;
+    border-color: #ebebed;
 }
 .light-theme .reaction-count {
-    color: #62636d;
+    color: #313338;
 }
-.light-theme .embed-reactions .reaction {
-    background: #efe9e3;
+.light-theme .reaction-burst {
+    background: #e7e8fb;
+    border-color: #5865f2;
 }
 .light-theme .mention {
     color: #2e3c88;
@@ -1066,7 +1687,18 @@ body.light-theme,
     border-left-color: #9e5a01;
     background: #faf4eb;
     margin-left: 0 !important;
-    padding-left: 12px;
+    padding-left: 8px !important;
+}
+/* File and audio cards carry dark inline colours for legacy browsers. */
+.light-theme .file-card {
+    background: #f9f9fa;
+    border-color: #e3e5e8;
+}
+.light-theme .file-card-name font {
+    color: #006ce7;
+}
+.light-theme .file-card-size font {
+    color: #5c5e66;
 }
 .light-theme a {
     color: #0067e0;
@@ -1112,8 +1744,17 @@ body.light-theme,
 .light-theme hr {
     border-color: #e3e5e8;
 }
+.edited-marker {
+    font-size: 10px;
+    color: #8d8e96;
+    white-space: nowrap;
+}
+.light-theme .edited-marker {
+    color: #5c5e66;
+}
+
 .light-theme .discord-timestamp {
-    background: #dcdef9;
+    background: #e6e6e8;
     color: #323339;
 }
 .light-theme .spoiler-box {
@@ -1134,14 +1775,8 @@ body.amoled-theme,
     background: #09090a !important;
     color: #dcdcdf !important;
 }
-.amoled-theme .content-padding,
-.amoled-theme .scrollable-content {
+.amoled-theme .content-padding {
     background: #09090a;
-    color: #dcdcdf;
-}
-.amoled-theme .header-title,
-.amoled-theme .header-menu,
-.amoled-theme .header-menu-link {
     color: #dcdcdf;
 }
 .amoled-theme .message {
@@ -1166,21 +1801,12 @@ body.amoled-theme,
 .amoled-theme .message:hover {
     background: rgba(255, 255, 255, 0.05) !important;
 }
-.amoled-theme .message-author {
-    color: #dcdcdf;
-}
-.amoled-theme .message-date {
-    color: #767780;
-}
 .amoled-theme .message-date-font {
     color: #767780 !important;
 }
 .amoled-theme .message-form-container {
     background: #09090a !important;
     border-top-color: #333333 !important;
-}
-.amoled-theme .icon-button:hover {
-    background: rgba(255, 255, 255, 0.08) !important;
 }
 .amoled-theme .message-action-btn:hover {
     background: rgba(255, 255, 255, 0.08) !important;
@@ -1193,18 +1819,51 @@ body.amoled-theme,
     background: rgba(255, 255, 255, 0.08) !important;
 }
 .amoled-theme .reaction {
-    background: #1d1d20;
-    border-color: #222;
+    background: #141416;
+    border-color: #141416;
 }
 .amoled-theme .reaction-count {
-    color: #9e9ea5;
+    color: #dbdee1;
 }
-.amoled-theme .embed-reactions .reaction {
-    background: #312a21;
+.amoled-theme .reaction-burst {
+    background: #191a2b;
+    border-color: #5865f2;
 }
 .amoled-theme .embed-content {
     background: #141416;
     border-color: #222;
+}
+.amoled-theme .embed-color-bar {
+    background-color: #222;
+}
+.amoled-theme .poll,
+.amoled-theme .poll-result {
+    background: #0a0a0a;
+    border-color: #1e1f22;
+}
+.amoled-theme .poll-answer {
+    background: #141416;
+    border-color: #141416;
+}
+.amoled-theme .poll-answer-fill {
+    background: #222226;
+}
+.amoled-theme .poll-answer-winner {
+    border-color: #23a559;
+}
+.amoled-theme .poll-answer-winner .poll-answer-fill {
+    background: #13301f;
+}
+.amoled-theme .component-container {
+    background: #141416;
+    border-color: #222;
+}
+.amoled-theme .component-select {
+    background: #0a0a0a;
+    border-color: #222;
+}
+.amoled-theme .component-separator-line {
+    border-top-color: #222;
 }
 .amoled-theme .forwarded-block-cell {
     border-left-color: #3b3c43;
@@ -1233,7 +1892,11 @@ body.amoled-theme,
     border-left-color: #c97e01;
     background: #20160a;
     margin-left: 0 !important;
-    padding-left: 12px;
+    padding-left: 8px !important;
+}
+.amoled-theme .file-card {
+    background: #0a0a0a;
+    border-color: #1e1f22;
 }
 .amoled-theme pre,
 .amoled-theme code {
@@ -1284,8 +1947,8 @@ body.amoled-theme,
     background: #1d1d20;
 }
 .amoled-theme .discord-timestamp {
-    background: #1d204c;
-    color: #94a8ff;
+    background: #1d1d20;
+    color: #dcdcdf;
 }
 
 /* ================================================================
@@ -1414,7 +2077,7 @@ html.page-food body {
     min-height: 100%;
 }
 
-/* Override themes.css which sets #wrapper to #303338; keep it matching body */
+/* Keep the drawing page's wrapper matching its body. */
 html.page-draw #wrapper {
     background: #1a1a1e;
 }
@@ -1519,6 +2182,16 @@ html.page-simple .amoled-theme #wrapper .discross-button.secondary:hover {
 }
 html.page-simple .amoled-theme #wrapper a:not(.discross-button) {
     color: #00aff4 !important;
+}
+html.page-simple #wrapper #passkey-login,
+html.page-simple #passkey-login {
+    background: #4f545c !important;
+    color: white !important;
+    margin: 12px 0 0 0 !important;
+}
+html.page-simple #wrapper #passkey-login:hover,
+html.page-simple #passkey-login:hover {
+    background: #5d6269 !important;
 }
 
 /* ================================================================
@@ -2819,149 +3492,84 @@ html.client-new3ds #canvas-wrapper {
    19. IMAGE GALLERIES
    ================================================================ */
 
-.image-gallery {
-    display: block;
+/* Discord's multi-image mosaic (see mosaicUtils.ts). Each row is a fixed
+   table; tiles hold their shape with padding-top, and the image fills the
+   tile absolutely. Only the mosaic's outer corners are rounded. */
+.mosaic {
     width: 100%;
     max-width: 520px;
-    margin-top: 8px;
-    font-size: 0; /* Remove whitespace between inline-block elements */
-}
-
-/* Modern grid support */
-@supports (display: grid) {
-    .image-gallery {
-        display: grid;
-        gap: 4px;
-    }
-    .gallery-item {
-        width: auto !important;
-        margin: 0 !important;
-    }
-    /* Grid configurations */
-    .gallery-2 {
-        grid-template-columns: repeat(2, 1fr);
-    }
-    .gallery-3 {
-        grid-template-columns: repeat(3, 1fr);
-    }
-    .gallery-4 {
-        grid-template-columns: repeat(2, 1fr);
-    }
-    .gallery-5,
-    .gallery-6 {
-        grid-template-columns: repeat(3, 1fr);
-    }
-    .gallery-7,
-    .gallery-8,
-    .gallery-9,
-    .gallery-10 {
-        grid-template-columns: repeat(3, 1fr);
-    }
-}
-
-.gallery-item {
-    display: inline-block;
-    vertical-align: top;
-    position: relative;
+    margin-top: 4px;
+    border-radius: 8px;
     overflow: hidden;
-    width: 32%; /* Fallback for 3 columns */
-    margin: 0.5%;
+}
+.mosaic-row {
+    table-layout: fixed;
+    border-collapse: collapse;
+    padding: 0;
+    margin: 0;
+}
+/* 1px around every tile makes 2px gaps; the inner wrapper's -1px margin
+   pushes the outer edge padding under the clipped, rounded border. */
+.mosaic-inner {
+    margin: -1px;
+}
+.mosaic-cell {
+    padding: 1px;
+    vertical-align: top;
+}
+.mosaic-tile {
+    position: relative;
+    height: 0;
+    overflow: hidden;
     background: #2f3136;
-    border-radius: 4px;
 }
-
-/* Force square aspect ratio */
-.gallery-item:before {
-    content: '';
-    display: block;
-    padding-top: 100%;
-}
-
-.gallery-item a {
+.mosaic-link {
     position: absolute;
     top: 0;
     left: 0;
-    bottom: 0;
     right: 0;
+    bottom: 0;
+    display: block;
+    overflow: hidden;
 }
-
-.gallery-image {
+.mosaic-image {
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: cover;
-    display: block;
+    border: 0;
 }
-
-/* Adjustments for different counts in fallback mode */
-.gallery-2 .gallery-item {
-    width: 49%;
+.mosaic-spoiler {
+    cursor: pointer;
 }
-.gallery-4 .gallery-item {
-    width: 49%;
+.mosaic-spoiler .mosaic-image {
+    filter: blur(16px);
 }
-
-/* Handle spoilers inside gallery */
-.image-gallery .spoiler-box {
-    margin: 0;
-    width: 100%;
-    height: 100%;
-    display: block;
+.mosaic-spoiler-label {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    margin-top: -10px;
+    text-align: center;
+    font-size: 14px;
+    line-height: 20px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    color: #ffffff;
 }
-.image-gallery .spoiler-box br {
+.mosaic-spoiler-revealed {
+    cursor: auto;
+}
+.mosaic-spoiler-revealed .mosaic-image {
+    filter: none;
+}
+.mosaic-spoiler-revealed .mosaic-spoiler-label {
     display: none;
 }
-.image-gallery .spoiler-box td {
-    width: 100%;
-    height: 100%;
-}
-.image-gallery .spoiler-box img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    max-width: none !important;
-    max-height: none !important;
-}
-
-/* Fallback for aspect ratio when :before trick fails or images are broken */
-.gallery-image {
-    min-width: 200px;
-    min-height: 150px;
-}
-
-/* Fallback for aspect ratio when :before trick fails or images are broken */
-.gallery-image {
-    min-width: 200px;
-    min-height: 150px;
-}
-
-.gallery-item {
-    background: #2f3136 !important;
-    min-width: 150px !important;
-    min-height: 150px !important;
-}
-
-.gallery-image {
-    width: 100% !important;
-    height: 100% !important;
-    min-width: 150px !important;
-    min-height: 150px !important;
-    object-fit: cover !important;
-    display: block !important;
-}
-
-/* Absolute fallback for gallery items to ensure visibility */
-.gallery-item,
-.gallery-item a,
-.gallery-image {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Final attempt to fix image visibility */
-.gallery-image {
-    min-width: 200px !important;
-    min-height: 150px !important;
+.embed .mosaic {
+    max-width: 400px;
+    margin-top: 0;
 }
 
 /* Mobile optimizations for small viewports (e.g. iPhone 17 402px) */
@@ -2979,26 +3587,48 @@ html.client-new3ds #canvas-wrapper {
     .nav-spacer {
         display: none !important;
     }
-    /* Adjust gallery to 2 columns on mobile */
-    .image-gallery {
-        display: block !important;
-        text-align: center;
-    }
-    .gallery-item {
-        width: 48% !important;
-        margin: 1% !important;
-        min-width: 0 !important;
-        min-height: 0 !important;
-    }
-    .gallery-image {
-        min-width: 0 !important;
-        min-height: 0 !important;
-    }
 }
 
 @media screen and (max-width: 380px) {
     #wrapper > table:first-child font[size='7'] {
         font-size: 18px !important;
+    }
+    /* The 64px logo cell is the other half of what makes the header wider than a
+       320px phone. */
+    #wrapper > table:first-child td:first-child {
+        width: 40px !important;
+        min-width: 0 !important;
+    }
+    #wrapper > table:first-child img[src*='logo'] {
+        width: 40px !important;
+        height: 40px !important;
+    }
+}
+
+/* The four-column stocks and currency tables are wider than a 320px phone. */
+@media screen and (max-width: 340px) {
+    table[style*='max-width: 580px'] td,
+    table[style*='max-width: 580px'] th {
+        padding-left: 2px !important;
+        padding-right: 2px !important;
+    }
+    table[style*='max-width: 580px'] font {
+        font-size: 13px !important;
+    }
+}
+
+/* First-generation iPhone SE and similar: Login + Register + the theme button
+   still don't fit beside the wordmark without a little more room. */
+@media screen and (max-width: 340px) {
+    #wrapper > table:first-child font[size='7'] {
+        font-size: 15px !important;
+    }
+    #wrapper > table:first-child font[size='4'] {
+        font-size: 12px !important;
+    }
+    #wrapper > table:first-child td {
+        padding-left: 0 !important;
+        padding-right: 4px !important;
     }
 }
 
@@ -3095,6 +3725,14 @@ html.client-psp .server-rail {
    the whole row past the viewport on narrow screens. With max-width:0 the cell
    takes only the leftover space and truncates, so it's responsive by default
    and needs no per-device width. */
+/* The quoted author's avatar between the reply connector and their name. */
+.reply-avatar {
+    width: 16px;
+    height: 16px;
+    margin-right: 4px;
+    border-radius: 50%;
+    vertical-align: -3px;
+}
 .reply-content-cell {
     max-width: 0 !important;
     width: 100% !important;
@@ -3130,10 +3768,13 @@ html.client-psp .server-rail {
         overflow-wrap: break-word !important;
     }
 
+    /* Break inside a link only when it can't fit on a line of its own (long URLs);
+       break-all split short link text such as "Discord" mid-word. The 3DS/PSP
+       rules below keep break-all because those engines lack "anywhere". */
     #msgcontainer a {
         word-wrap: break-word !important;
-        word-break: break-all !important;
-        overflow-wrap: break-word !important;
+        word-break: normal !important;
+        overflow-wrap: anywhere !important;
     }
 
     /* 2-column header: author shrinks, meta stays at right */
@@ -3208,6 +3849,37 @@ html.client-dsi .message-author-cell,
 html.client-psp .message-author-cell {
     max-width: none !important;
     overflow: visible !important;
+}
+
+/* These clients have very little horizontal room (down to a couple hundred
+   px); drop the avatar column rather than fight it for space against the name. */
+html.client-3ds .message-avatar-cell,
+html.client-new3ds .message-avatar-cell,
+html.client-dsi .message-avatar-cell,
+html.client-psp .message-avatar-cell,
+html.client-3ds .message-avatar-col,
+html.client-new3ds .message-avatar-col,
+html.client-dsi .message-avatar-col,
+html.client-psp .message-avatar-col {
+    display: none !important;
+}
+
+/* With the avatar column gone, the content column is the whole table. */
+html.client-3ds .message-content-col,
+html.client-new3ds .message-content-col,
+html.client-dsi .message-content-col,
+html.client-psp .message-content-col {
+    width: 100%;
+}
+
+@media screen and (max-width: 360px) {
+    .message-avatar-cell,
+    .message-avatar-col {
+        display: none;
+    }
+    .message-content-col {
+        width: 100%;
+    }
 }
 
 html.client-3ds .message-meta-cell,
@@ -3531,7 +4203,7 @@ html.client-psp .light-theme .messagecontent font {
         font-size: calc(16px * var(--ui-scale, 1));
     }
     .reaction-count {
-        font-size: calc(12px * var(--ui-scale, 1));
+        font-size: calc(14px * var(--ui-scale, 1));
     }
     .message-input-field {
         font-size: var(--ui-font-size, 16px);
@@ -3610,4 +4282,9 @@ html.client-wii.page-server #wrapper > table,
 html.client-wii.page-server #wrapper td {
     margin-top: 0 !important;
     padding-top: 0 !important;
+}
+
+/* Server rail drag-and-drop reordering */
+.server-link.server-dragging {
+    opacity: 0.4;
 }
