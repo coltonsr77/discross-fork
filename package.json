@@ -4,7 +4,7 @@
     "description": "A webhook bridge to send messages on Discord through a webpage",
     "main": "index.ts",
     "dependencies": {
-        "@sentry/node": "^10.40.0",
+        "@sentry/node": "^11.17.0",
         "async-lock": "^1.4.1",
         "bcrypt": "^6.0.0",
         "better-sqlite3": "^13.2.0",
